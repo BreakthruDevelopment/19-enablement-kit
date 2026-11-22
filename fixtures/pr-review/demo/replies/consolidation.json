@@ -1,0 +1,13 @@
+{
+  "description": "Recorded consolidation pass over the demo diff.",
+  "replies": [
+    {
+      "stop_reason": "end_turn",
+      "text": "{\"groups\": [{\"members\": [3, 4, 6]}, {\"members\": [0]}, {\"members\": [1, 7]}, {\"members\": [2]}, {\"members\": [5]}]}",
+      "usage": {
+        "input_tokens": 5200,
+        "output_tokens": 70
+      }
+    }
+  ]
+}

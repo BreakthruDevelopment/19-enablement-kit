@@ -1,0 +1,13 @@
+{
+  "description": "Recorded project-rules pass over the demo diff.",
+  "replies": [
+    {
+      "stop_reason": "end_turn",
+      "text": "{\n \"findings\": [\n  {\n   \"path\": \"src/main/java/com/harbor/oms/search/OrderSearchDao.java\",\n   \"line\": 40,\n   \"category\": \"project-rules\",\n   \"claim\": \"Query text is built from a request value instead of a PreparedStatement with bound parameters.\",\n   \"evidence_quote\": \"\\\" WHERE c.name LIKE '%\\\" + nameFragment + \\\"%'\\\"\",\n   \"criterion_id\": \"RUL-2\"\n  },\n  {\n   \"path\": \"src/main/java/com/harbor/oms/search/OrderSearchService.java\",\n   \"line\": 43,\n   \"category\": \"project-rules\",\n   \"claim\": \"The exception is printed with printStackTrace instead of being logged through SLF4J and surfaced.\",\n   \"evidence_quote\": \"e.printStackTrace();\",\n   \"criterion_id\": \"RUL-3\"\n  }\n ],\n \"passes_run\": [\n  \"project-rules\"\n ]\n}",
+      "usage": {
+        "input_tokens": 4400,
+        "output_tokens": 190
+      }
+    }
+  ]
+}
