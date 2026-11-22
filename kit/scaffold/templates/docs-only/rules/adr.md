@@ -1,6 +1,5 @@
 ---
-paths:
-  - "docs/adr/**/*.md"
+paths: "docs/adr/**/*.md"
 ---
 
 # Architecture decision records

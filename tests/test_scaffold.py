@@ -12,6 +12,7 @@ import difflib
 import errno
 import json
 import os
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
@@ -197,8 +198,13 @@ def test_each_kind_has_a_hierarchy_rules_commands_and_skills(kind: Kind) -> None
     for path in rules:
         text = (TEMPLATES / kind.value / _source_for(path)).read_text(encoding="utf-8")
         front = _frontmatter(text)
-        assert "paths:" in front
-        assert '"' in front
+        # A scalar, on one line, quoted. Not a YAML block list: Claude Code's loader reads this
+        # value as a string and splits it on commas, so `- "a"` / `- "b"` arrives concatenated
+        # as `ab` and the rule then matches nothing. A one-element list survives that by
+        # accident, which is why only the two-element rule was dead and why the shape, not the
+        # presence, is what this pins.
+        assert re.search(r'^paths: "[^"\n]+"$', front, re.M), path
+        assert "\n  - " not in front, path
     for path in commands:
         text = (TEMPLATES / kind.value / _source_for(path)).read_text(encoding="utf-8")
         front = _frontmatter(text)
@@ -524,6 +530,95 @@ def test_a_failed_write_leaves_no_scaffold_file_and_no_temp(
     assert list(target.rglob(".kit-*")) == []
 
 
+def test_every_rule_glob_is_a_single_comma_separated_value() -> None:
+    # The dead rule this pins was `paths:` with two block-list entries, which the loader read as
+    # one concatenated glob (`dd/**/*.xmlweb/**/*.xml`) that matches no file. Both of the
+    # descriptors globs must survive as separate globs on one line.
+    descriptors = (
+        TEMPLATES / Kind.JAVA_LEGACY_COMPANION.value / "rules" / "descriptors.md"
+    ).read_text(encoding="utf-8")
+    front = _frontmatter(descriptors)
+    match = re.search(r'^paths: "([^"\n]+)"$', front, re.M)
+    assert match, front
+    globs = [part.strip() for part in match.group(1).split(",")]
+    assert globs == ["dd/**/*.xml", "web/**/*.xml"]
+    for glob in globs:
+        assert "*.xml" in glob and glob.count("**") == 1
+
+
+def test_an_empty_target_is_refused_and_is_not_the_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `Path("")` is relative, so an empty target would resolve to the working directory and
+    # scaffold whatever the caller is standing in -- with `force`, over the top of it. The CLI
+    # refuses it, but `write_scaffold` is exported and later slices call it directly.
+    monkeypatch.chdir(tmp_path)
+    keep = tmp_path / "CLAUDE.md"
+    keep.write_text("mine\n", encoding="utf-8")
+    with pytest.raises(ScaffoldError) as caught:
+        write_scaffold("", Kind.DOCS_ONLY, _lead(), force=True)
+    assert caught.value.code is ScaffoldCode.TARGET_UNUSABLE
+    # The same refusal, and the same reasoning, as `kit.core.sandbox._as_root`: `realpath("")` is
+    # the working directory, and that is not a reasonable reading of an empty string. (`Path("")`
+    # is already `Path(".")` by the time it arrives, so an explicit `.` still means here.)
+    assert keep.read_text(encoding="utf-8") == "mine\n"
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["CLAUDE.md"]
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "a" * 129,
+        "/".join(["d"] * 17),
+        "dir\\file.md",
+        "dir//file.md",
+        "../escape.md",
+        "./here.md",
+    ],
+)
+def test_template_output_paths_outside_the_shape_are_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output: str
+) -> None:
+    # The segment length, the depth and the backslash rule had no test of their own.
+    target = tmp_path / "repo"
+    _patch_loader(monkeypatch, (LoadedTemplate(output, b"body\n"),))
+    with pytest.raises(ScaffoldError) as caught:
+        write_scaffold(target, Kind.DOCS_ONLY, _lead())
+    assert caught.value.code is ScaffoldCode.BAD_TEMPLATE
+    assert not target.exists()
+
+
+def test_a_failure_on_a_later_item_leaves_no_staged_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `_discard` was unexercised: the existing write-failure tests fail on the *first* item, so
+    # only `_cleanup_stage` ran. Fail on a later one and every earlier temporary must go too.
+    target = tmp_path / "repo"
+    target.mkdir()
+    real_write = os.write
+    seen: list[int] = []
+
+    def failing(fd: int, data: bytes) -> int:
+        # Count calls, not distinct descriptors: each staged file is opened, written and closed,
+        # so the kernel hands the same number straight back and a set of fds stays tiny.
+        seen.append(fd)
+        if len(seen) > 3:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", failing)
+    try:
+        with pytest.raises(ScaffoldError) as caught:
+            write_scaffold(target, Kind.DOCS_ONLY, _lead())
+    finally:
+        monkeypatch.undo()
+    assert caught.value.code is ScaffoldCode.WRITE_FAILED
+    assert len(seen) > 3  # it really did get past the first few files
+    assert list(target.rglob(".kit-*")) == []
+    for relative in EXPECTED[Kind.DOCS_ONLY]:
+        assert not (target / relative).exists()
+
+
 def test_a_failed_close_is_a_refusal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "repo"
     target.mkdir()
@@ -549,9 +644,12 @@ def test_a_short_write_is_finished(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     real_write = os.write
     calls: list[int] = []
 
+    payloads: list[bytes] = []
+
     def grudging(fd: int, data: bytes) -> int:
         taken = real_write(fd, data[:1])
         calls.append(taken)
+        payloads.append(data[:taken])
         return taken
 
     monkeypatch.setattr(os, "write", grudging)
@@ -561,7 +659,14 @@ def test_a_short_write_is_finished(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         monkeypatch.undo()
     written = _tree_bytes(target)
     assert set(written) == set(EXPECTED[Kind.DOCS_ONLY])
-    assert sum(len(payload) for payload in written.values()) == len(calls)
+    # Compare what landed with a tree written by an unhobbled `os.write`, not two counts that
+    # shrink together: a `sum(len(...)) == len(calls)` assertion holds for any truncating writer,
+    # including one that writes a single byte per file and stops.
+    control = tmp_path / "control"
+    write_scaffold(control, Kind.DOCS_ONLY, _lead())
+    assert written == _tree_bytes(control)
+    assert all(len(payload) == 1 for payload in payloads)  # the stub really was grudging
+    assert len(calls) == sum(len(payload) for payload in written.values())
 
 
 @pytest.mark.parametrize(
@@ -584,7 +689,12 @@ def test_a_template_over_the_sandbox_cap_is_refused(
 ) -> None:
     target = tmp_path / "repo"
     cap = SandboxLimits().max_file_bytes
-    _patch_loader(monkeypatch, (LoadedTemplate("CLAUDE.md", b"x" * (cap + 1)),))
+    # One byte over the cap and otherwise *valid*: UTF-8, no NUL, no CR, and it ends with a
+    # newline. `b"x" * (cap + 1)` has no trailing newline, so `_check_content`'s newline rule
+    # refuses it too and the test passed with the cap deleted.
+    over = b"x" * cap + b"\n"
+    assert len(over) == cap + 1 and over.endswith(b"\n")
+    _patch_loader(monkeypatch, (LoadedTemplate("CLAUDE.md", over),))
     with pytest.raises(ScaffoldError) as caught:
         write_scaffold(target, Kind.DOCS_ONLY, _lead())
     assert caught.value.code is ScaffoldCode.BAD_TEMPLATE

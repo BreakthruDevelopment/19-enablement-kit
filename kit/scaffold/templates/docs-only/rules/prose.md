@@ -1,6 +1,5 @@
 ---
-paths:
-  - "docs/**/*.md"
+paths: "docs/**/*.md"
 ---
 
 # Prose

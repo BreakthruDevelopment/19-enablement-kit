@@ -112,6 +112,13 @@ def _resolve_target(target: Path | str) -> Path:
     # the name at the NUL and examine a different path.
     if "\0" in os.fspath(target):
         raise ScaffoldError(ScaffoldCode.UNREADABLE)
+    # An empty target is not "here": `Path("")` is relative, so it would resolve to the working
+    # directory and scaffold whatever the caller happens to be standing in -- with `force` on,
+    # over the top of it. The CLI refuses it, but `write_scaffold` is public and later slices
+    # call it directly, so the refusal belongs here. `kit.core.sandbox._as_root` refuses an empty
+    # root for the same reason; this is the write path agreeing with the read path.
+    if not str(target):
+        raise ScaffoldError(ScaffoldCode.TARGET_UNUSABLE)
     try:
         raw_path = Path(target)
         raw = raw_path if raw_path.is_absolute() else Path.cwd() / raw_path

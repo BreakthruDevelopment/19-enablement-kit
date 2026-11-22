@@ -1,6 +1,5 @@
 ---
-paths:
-  - "sql/**/*.sql"
+paths: "sql/**/*.sql"
 ---
 
 # SQL

@@ -1,6 +1,5 @@
 ---
-paths:
-  - "web/**/*.jsp"
+paths: "web/**/*.jsp"
 ---
 
 # JSP

@@ -1,7 +1,5 @@
 ---
-paths:
-  - "dd/**/*.xml"
-  - "web/**/*.xml"
+paths: "dd/**/*.xml, web/**/*.xml"
 ---
 
 # Deployment descriptors

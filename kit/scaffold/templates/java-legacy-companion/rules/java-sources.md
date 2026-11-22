@@ -1,6 +1,5 @@
 ---
-paths:
-  - "src/**/*.java"
+paths: "src/**/*.java"
 ---
 
 # Java sources

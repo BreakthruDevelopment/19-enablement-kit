@@ -1,6 +1,5 @@
 ---
-paths:
-  - "src/**/*.py"
+paths: "src/**/*.py"
 ---
 
 # Python sources
