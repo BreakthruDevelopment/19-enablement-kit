@@ -116,18 +116,29 @@ def _resolve_target(target: Path | str) -> Path:
     # directory and scaffold whatever the caller happens to be standing in -- with `force` on,
     # over the top of it. The CLI refuses it, but `write_scaffold` is public and later slices
     # call it directly, so the refusal belongs here. `kit.core.sandbox._as_root` refuses an empty
-    # root for the same reason; this is the write path agreeing with the read path.
+    # root for the same reason; this is the write path agreeing with the read path. It does not
+    # catch `Path("")`, which pathlib has already made `Path(".")`: an explicit `.` is a target
+    # the caller named, and the CLI's `_target` refuses the empty string before that.
     if not str(target):
         raise ScaffoldError(ScaffoldCode.TARGET_UNUSABLE)
     try:
         raw_path = Path(target)
         raw = raw_path if raw_path.is_absolute() else Path.cwd() / raw_path
-        absolute = Path(os.path.normpath(raw))
-        name = absolute.name
-        parent_real = Path(os.path.realpath(absolute.parent))
+        # The parent is resolved from the path **as written**, never from a lexically cleaned
+        # copy. `os.path.normpath` collapses `a/link/../target` to `a/target` by text, before any
+        # link is read, so with `link -> outside/deep` the scaffold landed in `a/target` while
+        # POSIX resolution -- and the caller -- meant `outside/target`. Every check below is
+        # correct, but all of them measure against the root this line returns, so getting it
+        # wrong puts a correct scaffold in a directory nobody named. `realpath` on the parent as
+        # written reads the link first and lets `..` act on what it points at, which is what
+        # `kit.core.sandbox._real` does on the read path for the same string.
+        name = raw.name
+        parent_real = Path(os.path.realpath(raw.parent))
     except (OSError, ValueError):
         raise ScaffoldError(ScaffoldCode.UNREADABLE) from None
-    if name == "":
+    # `""` is the name of `/`; `..` names the parent, and taking it as a final component would
+    # ask `realpath` for a directory while treating it as a name to create.
+    if name in {"", ".."}:
         raise ScaffoldError(ScaffoldCode.TARGET_UNUSABLE)
     try:
         parent_is_dir = parent_real.is_dir()

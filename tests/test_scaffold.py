@@ -12,7 +12,6 @@ import difflib
 import errno
 import json
 import os
-import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
@@ -198,13 +197,16 @@ def test_each_kind_has_a_hierarchy_rules_commands_and_skills(kind: Kind) -> None
     for path in rules:
         text = (TEMPLATES / kind.value / _source_for(path)).read_text(encoding="utf-8")
         front = _frontmatter(text)
-        # A scalar, on one line, quoted. Not a YAML block list: Claude Code's loader reads this
-        # value as a string and splits it on commas, so `- "a"` / `- "b"` arrives concatenated
-        # as `ab` and the rule then matches nothing. A one-element list survives that by
-        # accident, which is why only the two-element rule was dead and why the shape, not the
-        # presence, is what this pins.
-        assert re.search(r'^paths: "[^"\n]+"$', front, re.M), path
-        assert "\n  - " not in front, path
+        # Every rule is conditional on a path, and each glob must be a glob -- not one glob with
+        # two patterns run together, which is the shape a rule file can acquire by accident and
+        # which would match nothing. `_paths_globs` reads either YAML spelling, because the
+        # loader accepts either; what is pinned is the globs, not how they are written.
+        globs = _paths_globs(front)
+        assert globs, path
+        for glob in globs:
+            assert glob == glob.strip() and glob
+            assert "*" in glob
+            assert glob.count("**") <= 1
     for path in commands:
         text = (TEMPLATES / kind.value / _source_for(path)).read_text(encoding="utf-8")
         front = _frontmatter(text)
@@ -530,20 +532,41 @@ def test_a_failed_write_leaves_no_scaffold_file_and_no_temp(
     assert list(target.rglob(".kit-*")) == []
 
 
-def test_every_rule_glob_is_a_single_comma_separated_value() -> None:
-    # The dead rule this pins was `paths:` with two block-list entries, which the loader read as
-    # one concatenated glob (`dd/**/*.xmlweb/**/*.xml`) that matches no file. Both of the
-    # descriptors globs must survive as separate globs on one line.
+def _paths_globs(front: str) -> list[str]:
+    """The globs a rule's `paths:` frontmatter names, in either YAML spelling.
+
+    A quoted scalar is split on commas, as the loader splits it; a block list is read as the
+    list it is. The two are equivalent to the loader -- its glob normaliser handles an array
+    before it splits a string -- so a test that insisted on one spelling would be forbidding a
+    conventional file for no reason. What matters is that each glob arrives whole.
+    """
+    lines = front.splitlines()
+    for index, line in enumerate(lines):
+        if not line.startswith("paths:"):
+            continue
+        inline = line[len("paths:") :].strip()
+        if inline:
+            return [part.strip() for part in inline.strip('"').split(",") if part.strip()]
+        out = []
+        for item in lines[index + 1 :]:
+            if not item.startswith("  - "):
+                break
+            out.append(item[len("  - ") :].strip().strip('"'))
+        return out
+    return []
+
+
+def test_the_descriptors_rule_names_both_of_its_globs() -> None:
+    # This rule is the only one with two globs, so it is the only one where a spelling mistake
+    # could run them together into a pattern that matches nothing. (An earlier review believed a
+    # YAML block list did exactly that. Read against the installed Claude Code, it does not: the
+    # frontmatter is parsed as YAML and the normaliser handles an array before it splits a string
+    # on commas. The committed scalar is simply the spelling that is unambiguous either way.)
     descriptors = (
         TEMPLATES / Kind.JAVA_LEGACY_COMPANION.value / "rules" / "descriptors.md"
     ).read_text(encoding="utf-8")
-    front = _frontmatter(descriptors)
-    match = re.search(r'^paths: "([^"\n]+)"$', front, re.M)
-    assert match, front
-    globs = [part.strip() for part in match.group(1).split(",")]
+    globs = _paths_globs(_frontmatter(descriptors))
     assert globs == ["dd/**/*.xml", "web/**/*.xml"]
-    for glob in globs:
-        assert "*.xml" in glob and glob.count("**") == 1
 
 
 def test_an_empty_target_is_refused_and_is_not_the_working_directory(
@@ -579,7 +602,10 @@ def test_an_empty_target_is_refused_and_is_not_the_working_directory(
 def test_template_output_paths_outside_the_shape_are_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output: str
 ) -> None:
-    # The segment length, the depth and the backslash rule had no test of their own.
+    # The segment length and the depth rule had no test of their own. (The backslash rule at
+    # `templates.py` is *not* separated by these cases: the per-segment character class refuses a
+    # backslash first, so deleting the explicit check leaves the suite green. It is redundant
+    # defence, not an unpinned control.)
     target = tmp_path / "repo"
     _patch_loader(monkeypatch, (LoadedTemplate(output, b"body\n"),))
     with pytest.raises(ScaffoldError) as caught:
@@ -793,3 +819,39 @@ def test_a_detail_cannot_carry_a_path() -> None:
     err = _build(ScaffoldCode.DENIED_NAME)
     with pytest.raises(TypeError):
         cast(dict[str, str], err.detail)["pattern"] = "no"
+
+
+def test_a_link_then_dotdot_resolves_where_posix_says_not_where_the_text_says(
+    tmp_path: Path,
+) -> None:
+    # `os.path.normpath` collapses `base/link/../target` to `base/target` as text, before any
+    # link is read. With `link -> outside/deep`, POSIX resolution -- and the caller -- mean
+    # `outside/target`. Every later check was correct but measured against the wrong root, so a
+    # correct scaffold landed in a directory nobody named, over the top of another repo.
+    (tmp_path / "base").mkdir()
+    (tmp_path / "outside" / "deep").mkdir(parents=True)
+    (tmp_path / "outside" / "target").mkdir()
+    (tmp_path / "base" / "target").mkdir()
+    bystander = tmp_path / "base" / "target" / "CLAUDE.md"
+    bystander.write_text("a different repo\n", encoding="utf-8")
+    (tmp_path / "base" / "link").symlink_to(tmp_path / "outside" / "deep")
+
+    asked = tmp_path / "base" / "link" / ".." / "target"
+    assert os.path.realpath(asked) == str(tmp_path / "outside" / "target")
+    write_scaffold(asked, Kind.DOCS_ONLY, _lead(), force=True)
+
+    assert (tmp_path / "outside" / "target" / "CLAUDE.md").exists()
+    assert (tmp_path / "outside" / "target" / ".claude").is_dir()
+    # The lexical sibling is untouched.
+    assert bystander.read_text(encoding="utf-8") == "a different repo\n"
+    assert not (tmp_path / "base" / "target" / ".claude").exists()
+
+
+def test_a_target_whose_last_component_is_dotdot_is_refused(tmp_path: Path) -> None:
+    # Resolving the parent from the path as written means a trailing `..` would ask `realpath`
+    # for a directory and then treat `..` as a name to create inside it.
+    (tmp_path / "repo").mkdir()
+    with pytest.raises(ScaffoldError) as caught:
+        write_scaffold(tmp_path / "repo" / "..", Kind.DOCS_ONLY, _lead(), force=True)
+    assert caught.value.code is ScaffoldCode.TARGET_UNUSABLE
+    assert not (tmp_path / "CLAUDE.md").exists()
