@@ -39,8 +39,16 @@ jobs:
         run: |
           uv build
           uv venv --python 3.12 /tmp/wheel-check
-          uv pip install --python /tmp/wheel-check/bin/python dist/*.whl
-          /tmp/wheel-check/bin/python -c "import kit, kit.core"
+          # A wheel carries no [tool.uv.sources], so installing it alone would look for
+          # `agent-container` on PyPI -- a package this project has never pinned and does not
+          # control. The locked set carries app 17's git URL and tag, so install that first and
+          # the wheel with --no-deps.
+          uv export --quiet --frozen --no-dev --no-emit-project --no-hashes -o /tmp/runtime-reqs.txt
+          uv pip install --python /tmp/wheel-check/bin/python -r /tmp/runtime-reqs.txt
+          uv pip install --python /tmp/wheel-check/bin/python --no-deps dist/*.whl
+          # `-P`, so the checkout root is off sys.path: without it this proves nothing about the
+          # wheel, because `kit/` beside the command would satisfy the import either way.
+          /tmp/wheel-check/bin/python -P -c "import kit, kit.core, agent_container"
       - name: Smoke test (installed CLI)
         run: |
           /tmp/wheel-check/bin/kit --version | tee smoke.out

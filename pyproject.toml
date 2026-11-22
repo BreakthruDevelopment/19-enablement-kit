@@ -4,11 +4,19 @@ version = "0.1.0"
 description = "The enablement kit: a read-only sandbox, a scaffold factory and review passes for legacy-code migration."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-# Nothing from app 17 is pinned here: that pin belongs to slice 19.2.
-dependencies = []
+dependencies = [
+    # App 17 (the agent container) is pinned by git TAG, never a branch or a bare commit. v0.1.0 is an
+    # annotated tag on 9955f1f. A slice that needs something later than this tag stops and comments on its
+    # issue. App 18 is NOT a dependency: its gateway is an external process named in config, and its contract
+    # is the frozen copy in `contracts/`.
+    "agent-container",
+]
 
 [project.scripts]
 kit = "kit.cli:main"
+
+[tool.uv.sources]
+agent-container = { git = "https://github.com/BreakthruDevelopment/17-agent-container", tag = "v0.1.0" }
 
 [dependency-groups]
 dev = [

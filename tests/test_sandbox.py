@@ -1,0 +1,444 @@
+"""The sandbox Proxy: one integration test per rule, against a real filesystem.
+
+Every test builds its tree on disk and reads it through a `Sandbox`, because the rules are about
+symlinks, path resolution and file sizes -- none of which a mocked filesystem would exercise. The
+escape fixtures are built here at test time rather than committed: a symlink to `/etc/passwd` is
+not something to put in a public repository.
+"""
+
+from pathlib import Path
+
+import pytest
+
+from kit.core.config import SandboxLimits
+from kit.core.errors import ErrorCode, KitError
+from kit.core.principals import Principal
+from kit.core.sandbox import DENY_PATTERNS, Sandbox, Usage
+
+
+def _tree(root: Path) -> Path:
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "Main.java").write_text("class Main {}\n")
+    (root / "README.md").write_text("# oms\n")
+    return root
+
+
+def _sandbox(root: Path, limits: SandboxLimits | None = None) -> Sandbox:
+    return Sandbox(Principal.engineer("dev"), [root], limits)
+
+
+# -- rule 1 and 2: symlinks resolved first, then the root allowlist ---------------------------
+
+
+def test_a_file_inside_a_root_is_read(tmp_path: Path) -> None:
+    box = _sandbox(_tree(tmp_path / "repo"))
+    assert box.read_text(tmp_path / "repo" / "src" / "Main.java") == "class Main {}\n"
+    assert box.usage.files_read == 1
+    assert box.usage.bytes_read == len("class Main {}\n")
+    assert box.refusals == ()
+
+
+def test_a_path_outside_every_root_is_refused(tmp_path: Path) -> None:
+    box = _sandbox(_tree(tmp_path / "repo"))
+    outside = tmp_path / "elsewhere.txt"
+    outside.write_text("secret\n")
+    with pytest.raises(KitError) as caught:
+        box.read_text(outside)
+    assert caught.value.code is ErrorCode.OUTSIDE_ROOT
+    assert caught.value.category.value == "permission"
+
+
+def test_dot_dot_cannot_climb_out_of_a_root(tmp_path: Path) -> None:
+    box = _sandbox(_tree(tmp_path / "repo"))
+    (tmp_path / "elsewhere.txt").write_text("secret\n")
+    with pytest.raises(KitError) as caught:
+        box.read_text(tmp_path / "repo" / "src" / ".." / ".." / "elsewhere.txt")
+    assert caught.value.code is ErrorCode.OUTSIDE_ROOT
+
+
+def test_a_symlink_out_of_the_tree_is_refused(tmp_path: Path) -> None:
+    # The escape a prefix test on the requested path would miss.
+    root = _tree(tmp_path / "repo")
+    (tmp_path / "outside.txt").write_text("secret\n")
+    (root / "escape.txt").symlink_to(tmp_path / "outside.txt")
+    with pytest.raises(KitError) as caught:
+        _sandbox(root).read_text(root / "escape.txt")
+    assert caught.value.code is ErrorCode.OUTSIDE_ROOT
+
+
+def test_a_symlinked_directory_out_of_the_tree_is_refused(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    (tmp_path / "away").mkdir()
+    (tmp_path / "away" / "notes.txt").write_text("secret\n")
+    (root / "away").symlink_to(tmp_path / "away", target_is_directory=True)
+    with pytest.raises(KitError) as caught:
+        _sandbox(root).read_text(root / "away" / "notes.txt")
+    assert caught.value.code is ErrorCode.OUTSIDE_ROOT
+
+
+def test_a_symlinked_root_still_serves_its_files(tmp_path: Path) -> None:
+    # Resolved to resolved. A raw-root comparison would refuse everything on macOS, where /tmp
+    # resolves to /private/tmp, and on a Linux box with a symlinked home.
+    real = _tree(tmp_path / "real")
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    box = Sandbox(Principal.engineer("dev"), [link])
+    assert box.roots == (real.resolve(),)
+    assert box.read_text(link / "README.md") == "# oms\n"
+    assert box.read_text(real / "README.md") == "# oms\n"
+
+
+def test_a_root_must_be_an_existing_directory(tmp_path: Path) -> None:
+    a_file = tmp_path / "file.txt"
+    a_file.write_text("x")
+    for roots in ([], [tmp_path / "missing"], [a_file]):
+        with pytest.raises(KitError) as caught:
+            Sandbox(Principal.engineer("dev"), roots)
+        assert caught.value.code is ErrorCode.BAD_ROOT
+
+
+# -- rule 3: the deny list, per segment of the resolved path ---------------------------------
+
+
+@pytest.mark.parametrize(
+    ("relative", "pattern"),
+    [
+        (".git/config", ".git"),
+        (".env", ".env*"),
+        (".env.local", ".env*"),
+        ("deploy/key.pem", "*.pem"),
+        ("src/id_rsa", "id_*"),
+        ("secrets/token.txt", "secrets"),
+        (".claude/settings.json", ".claude"),
+        ("nested/.git/hooks/pre-push", ".git"),
+    ],
+)
+def test_the_deny_list_refuses_before_the_open(tmp_path: Path, relative: str, pattern: str) -> None:
+    root = _tree(tmp_path / "repo")
+    target = root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("sensitive\n")
+    box = _sandbox(root)
+    with pytest.raises(KitError) as caught:
+        box.read_text(target)
+    assert caught.value.code is ErrorCode.DENIED_NAME
+    assert caught.value.detail == {"pattern": pattern}
+    assert caught.value.category.value == "permission"
+    # Refused before the open, so nothing was charged and the refusal is on the record.
+    assert box.usage.bytes_read == 0
+    assert [refusal.code for refusal in box.refusals] == [ErrorCode.DENIED_NAME]
+
+
+def test_a_denied_directory_denies_everything_beneath_it(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    (root / "secrets" / "deep" / "deeper").mkdir(parents=True)
+    (root / "secrets" / "deep" / "deeper" / "plain.txt").write_text("x\n")
+    with pytest.raises(KitError) as caught:
+        _sandbox(root).read_text(root / "secrets" / "deep" / "deeper" / "plain.txt")
+    assert caught.value.code is ErrorCode.DENIED_NAME
+
+
+def test_a_symlink_inside_the_root_aimed_at_a_denied_file_is_refused(tmp_path: Path) -> None:
+    # The same escape one layer down: resolving for the allowlist but matching the deny list on
+    # the requested name would leave exactly this hole.
+    root = _tree(tmp_path / "repo")
+    (root / ".env").write_text("TOKEN=shh\n")
+    (root / "harmless.txt").symlink_to(root / ".env")
+    with pytest.raises(KitError) as caught:
+        _sandbox(root).read_text(root / "harmless.txt")
+    assert caught.value.code is ErrorCode.DENIED_NAME
+    assert caught.value.detail == {"pattern": ".env*"}
+
+
+def test_the_deny_list_is_matched_per_segment_not_as_one_string(tmp_path: Path) -> None:
+    # `id_*` against the whole path would match nothing, because a path starts with a slash.
+    root = _tree(tmp_path / "repo")
+    (root / "a" / "b").mkdir(parents=True)
+    (root / "a" / "b" / "id_ed25519").write_text("key\n")
+    with pytest.raises(KitError) as caught:
+        _sandbox(root).read_text(root / "a" / "b" / "id_ed25519")
+    assert caught.value.detail == {"pattern": "id_*"}
+
+
+def test_a_denied_name_above_the_root_does_not_deny_the_tree(tmp_path: Path) -> None:
+    # Matched relative to its root: a checkout that happens to live under a directory called
+    # `secrets` is still readable, or the kit would refuse the operator's own layout.
+    root = tmp_path / "secrets" / "repo"
+    _tree(root)
+    assert _sandbox(root).read_text(root / "README.md") == "# oms\n"
+
+
+def test_an_uppercase_denied_name_is_refused(tmp_path: Path) -> None:
+    # On a case-insensitive filesystem `.ENV` opens `.env`; a case-sensitive match alone would
+    # let the request through.
+    root = _tree(tmp_path / "repo")
+    (root / ".ENV").write_text("TOKEN=shh\n")
+    with pytest.raises(KitError) as caught:
+        _sandbox(root).read_text(root / ".ENV")
+    assert caught.value.code is ErrorCode.DENIED_NAME
+
+
+def test_the_deny_list_is_the_specified_one() -> None:
+    assert DENY_PATTERNS == (".git", ".env*", "*.pem", "id_*", "secrets", ".claude")
+
+
+# -- rule 4: the three caps ------------------------------------------------------------------
+
+
+def test_the_per_file_byte_cap_refuses_rather_than_truncates(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    (root / "big.txt").write_text("x" * 200)
+    box = _sandbox(root, SandboxLimits(max_file_bytes=100))
+    with pytest.raises(KitError) as caught:
+        box.read_text(root / "big.txt")
+    assert caught.value.code is ErrorCode.FILE_BYTE_CAP
+    assert caught.value.category.value == "business"
+    assert caught.value.detail == {"cap": "max_file_bytes", "limit": 100, "size": 200}
+    # Nothing was served, so no caller can mistake a truncated read for a complete one.
+    assert box.usage == Usage(files_read=0, bytes_read=0)
+
+
+def test_the_per_run_byte_cap_stops_the_run(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    for index in range(3):
+        (root / f"f{index}.txt").write_text("x" * 40)
+    box = _sandbox(root, SandboxLimits(max_run_bytes=100))
+    assert len(box.read_text(root / "f0.txt")) == 40
+    assert len(box.read_text(root / "f1.txt")) == 40
+    with pytest.raises(KitError) as caught:
+        box.read_text(root / "f2.txt")
+    assert caught.value.code is ErrorCode.RUN_BYTE_CAP
+    assert caught.value.detail["cap"] == "max_run_bytes"
+    assert caught.value.detail["limit"] == 100
+    assert box.usage.bytes_read == 80
+
+
+def test_the_file_count_cap_stops_the_run(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    for index in range(3):
+        (root / f"f{index}.txt").write_text("x\n")
+    box = _sandbox(root, SandboxLimits(max_files=2))
+    box.read_text(root / "f0.txt")
+    box.read_text(root / "f1.txt")
+    with pytest.raises(KitError) as caught:
+        box.read_text(root / "f2.txt")
+    assert caught.value.code is ErrorCode.FILE_COUNT_CAP
+    assert caught.value.detail == {"cap": "max_files", "limit": 2}
+
+
+def test_re_reading_a_file_costs_bytes_but_not_another_file(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    box = _sandbox(root, SandboxLimits(max_files=1))
+    box.read_text(root / "README.md")
+    box.read_text(root / "README.md")
+    assert box.usage.files_read == 1
+    assert box.usage.bytes_read == 2 * len("# oms\n")
+
+
+def test_a_cap_refusal_is_recorded_for_the_brief(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    (root / "big.txt").write_text("x" * 200)
+    box = _sandbox(root, SandboxLimits(max_file_bytes=100))
+    with pytest.raises(KitError):
+        box.read_text(root / "big.txt")
+    refusal = box.refusals[0]
+    assert refusal.code is ErrorCode.FILE_BYTE_CAP
+    assert refusal.category.value == "business"
+    assert "max_file_bytes" in refusal.reason
+
+
+def test_no_refusal_carries_a_path(tmp_path: Path) -> None:
+    # A brief must be able to quote the reason without republishing the path that was refused.
+    root = _tree(tmp_path / "repo")
+    (root / ".env").write_text("TOKEN=shh\n")
+    box = _sandbox(root)
+    for target in (root / ".env", tmp_path / "outside.txt"):
+        with pytest.raises(KitError):
+            box.read_text(target)
+    for refusal in box.refusals:
+        assert str(root) not in refusal.reason
+        assert "TOKEN" not in refusal.reason
+        for value in refusal.detail.values():
+            assert "/" not in str(value)
+
+
+# -- existence, kind and decoding -------------------------------------------------------------
+
+
+def test_a_missing_file_inside_a_root_is_a_validation_error(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    with pytest.raises(KitError) as caught:
+        _sandbox(root).read_text(root / "nope.txt")
+    assert caught.value.code is ErrorCode.MISSING
+    assert caught.value.category.value == "validation"
+
+
+def test_a_directory_is_not_a_file(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    with pytest.raises(KitError) as caught:
+        _sandbox(root).read_text(root / "src")
+    assert caught.value.code is ErrorCode.NOT_A_FILE
+
+
+def test_bytes_that_are_not_text_refuse_rather_than_mangle(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    (root / "oms.jar").write_bytes(b"\xff\xfe\x00binary")
+    box = _sandbox(root)
+    assert box.read_bytes(root / "oms.jar") == b"\xff\xfe\x00binary"
+    with pytest.raises(KitError) as caught:
+        box.read_text(root / "oms.jar")
+    assert caught.value.code is ErrorCode.UNREADABLE
+
+
+# -- listing and walking ----------------------------------------------------------------------
+
+
+def test_list_dir_hides_denied_children_and_records_why(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    (root / ".env").write_text("TOKEN=shh\n")
+    (root / ".git").mkdir()
+    box = _sandbox(root)
+    names = [child.name for child in box.list_dir(root)]
+    assert names == ["README.md", "src"]
+    assert {refusal.code for refusal in box.refusals} == {ErrorCode.DENIED_NAME}
+
+
+def test_list_dir_charges_no_cap(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    box = _sandbox(root, SandboxLimits(max_files=1, max_run_bytes=1))
+    assert box.list_dir(root)
+    assert box.usage.files_read == 0
+
+
+def test_list_dir_refuses_a_file_and_a_path_outside(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    box = _sandbox(root)
+    with pytest.raises(KitError) as caught:
+        box.list_dir(root / "README.md")
+    assert caught.value.code is ErrorCode.NOT_A_DIRECTORY
+    with pytest.raises(KitError) as caught:
+        box.list_dir(tmp_path)
+    assert caught.value.code is ErrorCode.OUTSIDE_ROOT
+
+
+def test_walk_finds_the_readable_files_and_prunes_denied_subtrees(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    (root / ".git").mkdir()
+    (root / ".git" / "config").write_text("[core]\n")
+    (root / "secrets").mkdir()
+    (root / "secrets" / "token.txt").write_text("shh\n")
+    (root / "src" / "dao").mkdir()
+    (root / "src" / "dao" / "OrderDao.java").write_text("class OrderDao {}\n")
+    found = [path.relative_to(root).as_posix() for path in _sandbox(root).walk(root)]
+    assert found == ["README.md", "src/Main.java", "src/dao/OrderDao.java"]
+
+
+def test_walk_does_not_follow_a_symlink_out_of_the_tree(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    (tmp_path / "away").mkdir()
+    (tmp_path / "away" / "notes.txt").write_text("secret\n")
+    (root / "away").symlink_to(tmp_path / "away", target_is_directory=True)
+    found = [path.relative_to(root).as_posix() for path in _sandbox(root).walk(root)]
+    assert found == ["README.md", "src/Main.java"]
+
+
+def test_walk_terminates_on_a_symlink_loop(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    (root / "src" / "loop").symlink_to(root / "src", target_is_directory=True)
+    found = [path.relative_to(root).as_posix() for path in _sandbox(root).walk(root)]
+    assert found == ["README.md", "src/Main.java"]
+
+
+# -- writes ------------------------------------------------------------------------------------
+
+
+def test_writes_are_refused_entirely_for_engineer_and_ci(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    target.mkdir()
+    for principal in (Principal.engineer("dev"), Principal.ci()):
+        box = Sandbox(principal, [root], write_root=target)
+        with pytest.raises(KitError) as caught:
+            box.write_text("CLAUDE.md", "# rules\n")
+        assert caught.value.code is ErrorCode.FORBIDDEN
+        assert caught.value.category.value == "permission"
+    assert list(target.iterdir()) == []
+
+
+def test_lead_writes_only_under_the_write_root(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    target.mkdir()
+    box = Sandbox(Principal.lead("lead"), [root], write_root=target)
+    written = box.write_text("docs/CLAUDE.md", "# rules\n")
+    assert written == (target / "docs" / "CLAUDE.md").resolve()
+    assert written.read_text() == "# rules\n"
+
+
+def test_lead_cannot_write_outside_the_write_root(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    target.mkdir()
+    box = Sandbox(Principal.lead("lead"), [root], write_root=target)
+    for path in (Path("../escaped.md"), tmp_path / "escaped.md", root / "README.md"):
+        with pytest.raises(KitError) as caught:
+            box.write_text(path, "x\n")
+        assert caught.value.code is ErrorCode.OUTSIDE_ROOT
+    assert not (tmp_path / "escaped.md").exists()
+    assert (root / "README.md").read_text() == "# oms\n"
+
+
+def test_lead_cannot_write_through_a_symlinked_parent(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    target.mkdir()
+    (tmp_path / "away").mkdir()
+    (target / "away").symlink_to(tmp_path / "away", target_is_directory=True)
+    box = Sandbox(Principal.lead("lead"), [root], write_root=target)
+    with pytest.raises(KitError) as caught:
+        box.write_text("away/escaped.md", "x\n")
+    assert caught.value.code is ErrorCode.OUTSIDE_ROOT
+    assert not (tmp_path / "away" / "escaped.md").exists()
+
+
+def test_lead_cannot_write_a_denied_name(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    target.mkdir()
+    box = Sandbox(Principal.lead("lead"), [root], write_root=target)
+    for relative in (".git/config", ".env", ".claude/settings.json"):
+        with pytest.raises(KitError) as caught:
+            box.write_text(relative, "x\n")
+        assert caught.value.code is ErrorCode.DENIED_NAME
+
+
+def test_a_write_without_a_write_root_is_refused(tmp_path: Path) -> None:
+    box = Sandbox(Principal.lead("lead"), [_tree(tmp_path / "repo")])
+    with pytest.raises(KitError) as caught:
+        box.write_text("CLAUDE.md", "x\n")
+    assert caught.value.code is ErrorCode.WRITE_FORBIDDEN
+
+
+def test_a_write_obeys_the_per_file_cap(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    target.mkdir()
+    box = Sandbox(
+        Principal.lead("lead"), [root], write_root=target, limits=SandboxLimits(max_file_bytes=10)
+    )
+    with pytest.raises(KitError) as caught:
+        box.write_text("CLAUDE.md", "x" * 11)
+    assert caught.value.code is ErrorCode.FILE_BYTE_CAP
+    assert not (target / "CLAUDE.md").exists()
+
+
+# -- several roots ------------------------------------------------------------------------------
+
+
+def test_several_roots_are_each_allowed(tmp_path: Path) -> None:
+    first = _tree(tmp_path / "one")
+    second = _tree(tmp_path / "two")
+    box = Sandbox(Principal.engineer("dev"), [first, second])
+    assert box.read_text(first / "README.md") == "# oms\n"
+    assert box.read_text(second / "README.md") == "# oms\n"
+    assert box.usage.files_read == 2
