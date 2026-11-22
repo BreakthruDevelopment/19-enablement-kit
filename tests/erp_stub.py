@@ -68,6 +68,16 @@ def main(argv: list[str] | None = None) -> int:
         if mode == "hang":
             time.sleep(5)
             return 0
+        if mode == "flood":
+            # More than one message cap, with no newline anywhere. The client cannot stop on a
+            # line boundary, so its bound on the unterminated buffer is the only thing between
+            # it and reading until it runs out of memory.
+            block = "x" * 65536
+            for _ in range(20):
+                sys.stdout.write(block)
+            sys.stdout.flush()
+            time.sleep(5)
+            return 0
         if mode == "garbage" and method == "tools/call":
             sys.stdout.write("LEAK-this-body\n")
             sys.stdout.flush()

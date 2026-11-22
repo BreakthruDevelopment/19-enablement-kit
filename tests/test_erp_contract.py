@@ -161,6 +161,21 @@ def test_a_hung_gateway_is_reaped_by_the_recorded_pid() -> None:
     assert gateway.returncode is not None
 
 
+def test_a_gateway_that_floods_one_line_is_refused_on_the_buffer_bound() -> None:
+    # No newline ever arrives, so there is no line boundary to stop on and the bound on the
+    # unterminated buffer is the only thing between the client and reading until memory runs
+    # out. The code is what this asserts, not merely that it refused: without the bound the
+    # read runs to the deadline instead and the error is a timeout.
+    contract = load_contract(FROZEN)
+    gateway = StdioGateway(_config("flood"), contract, timeout=5)
+    with pytest.raises(ErpError) as caught:
+        gateway.start()
+    assert caught.value.code is ErpCode.PROTOCOL
+    assert caught.value.is_retryable is False
+    assert "xxx" not in str(caught.value)  # and the body is not quoted back
+    assert gateway.returncode is not None  # cleaned up by the pid it started
+
+
 def test_a_gateway_that_exits_is_unavailable() -> None:
     contract = load_contract(FROZEN)
     with pytest.raises(ErpError) as caught:
