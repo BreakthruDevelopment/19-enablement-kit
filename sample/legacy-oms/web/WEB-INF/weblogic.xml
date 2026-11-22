@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<weblogic-web-app xmlns="http://www.bea.com/ns/weblogic/90">
+  <context-root>oms</context-root>
+  <resource-description>
+    <res-ref-name>jdbc/OrderDS</res-ref-name>
+    <jndi-name>jdbc/HarborOrderDS</jndi-name>
+  </resource-description>
+  <ejb-reference-description>
+    <ejb-ref-name>ejb/OrderService</ejb-ref-name>
+    <jndi-name>ejb/harbor/OrderService</jndi-name>
+  </ejb-reference-description>
+</weblogic-web-app>
