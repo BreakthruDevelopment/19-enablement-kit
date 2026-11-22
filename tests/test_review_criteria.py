@@ -120,3 +120,12 @@ def test_a_merged_finding_keeps_its_own_criterion_in_the_report() -> None:
     )
     assert "SEC-1" in body
     assert "RUL-2" in body
+
+
+def test_one_bad_heading_in_an_otherwise_good_file_is_refused() -> None:
+    # The case the docstring is about, and the one `MALFORMED` misses: every entry there is a
+    # single-heading file, so a *skip* would empty `entries` and trip the "no entries" raise
+    # instead of showing that a malformed heading is refused rather than passed over.
+    text = "# Title\n\n## SEC-1 | critical | Good\nBody.\n\n## not a heading at all\nBody.\n"
+    with pytest.raises(ReviewError):
+        parse_criteria(PassName.SECURITY, text)

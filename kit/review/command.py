@@ -89,6 +89,15 @@ def run_review_command(
             f"kit review: could not complete; no response from: {names}. Nothing was posted.",
             file=err,
         )
+        if result.blocking:
+            # The one degraded case worth stating out loud: a pass got nothing back, so nothing
+            # is posted, *and* what the other passes did record would have blocked. Printing only
+            # the failed pass names would let that pass unnoticed.
+            print(
+                "kit review: findings that would have blocked are already on record"
+                f" ({len(result.recorded)} in all); re-run when the provider answers.",
+                file=err,
+            )
         return 1
     try:
         body = render_report(result)

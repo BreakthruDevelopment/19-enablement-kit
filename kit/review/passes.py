@@ -318,9 +318,14 @@ async def run_finding_pass(
         return _failed(name, reason or FailReason.NOT_PARSEABLE)
     try:
         output = parse_pass_output(text)
-    except PassOverflow:
-        # Schema-valid in shape, over the bound: rejected, not failed. See `PassOverflow`.
-        return PassResult(name, PassStatus.REJECTED, reasons=(RejectReason.OVERFLOW.value,))
+    except PassOverflow as overflow:
+        # Schema-valid in shape, over the bound: rejected, not failed. See `PassOverflow`. The
+        # findings it did raise are still graded and recorded -- dropping them would reward
+        # overflow -- and `grade` adds the overflow reason itself, since the trimmed set is still
+        # over the per-pass cap.
+        if overflow.output is None:
+            return PassResult(name, PassStatus.REJECTED, reasons=(RejectReason.OVERFLOW.value,))
+        return grade(name, criteria, diff, overflow.output)
     if output is None:
         return _failed(name, FailReason.NOT_PARSEABLE)
     return grade(name, criteria, diff, output)

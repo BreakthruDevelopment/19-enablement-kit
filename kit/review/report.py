@@ -45,21 +45,28 @@ def _where(r: RecordedFinding) -> str:
     return f"`{path}:{r.finding.line}`"
 
 
-def _item(item: PresentedFinding) -> list[str]:
-    lead = item.lead
-    out = [
-        f"- **{lead.severity.value}** {_one_line(lead.finding.criterion_id)} "
-        f"{_where(lead)} ({lead.pass_name.value}): {_one_line(lead.finding.claim)}",
-        *(f"  {line}" for line in _quote(lead.finding.evidence_quote)),
+def _finding_lines(r: RecordedFinding) -> list[str]:
+    return [
+        f"**{r.severity.value}** {_one_line(r.finding.criterion_id)} "
+        f"{_where(r)} ({r.pass_name.value}): {_one_line(r.finding.claim)}",
+        *(f"  {line}" for line in _quote(r.finding.evidence_quote)),
     ]
+
+
+def _item(item: PresentedFinding) -> list[str]:
+    head, *rest = _finding_lines(item.lead)
+    out = [f"- {head}", *rest]
     for m in item.merged:
-        # Each merged finding keeps its own criterion and line: a merge groups what consolidation
-        # says is one problem, and showing only the lead's text would let a grouping replace a
-        # real finding's claim with a decoy's.
-        out.append(
-            f"  Also: **{m.severity.value}** {_one_line(m.finding.criterion_id)} "
-            f"{_where(m)} ({m.pass_name.value})"
-        )
+        # Each merged finding keeps its own claim and its own quote, not just its criterion and
+        # line. A merge groups what consolidation says is one problem, and the lead is a model's
+        # choice twice over -- consolidation's grouping, and the order its own pass listed the
+        # findings in, which is what the recorded-index tie-break reads. So showing only the
+        # lead's text would let a trivial decoy listed first stand in for the real defect, in the
+        # only artifact the command emits. The recorded set would still hold it; the report would
+        # not say what it was.
+        also, *quoted = _finding_lines(m)
+        out.append(f"  Also: {also}")
+        out.extend(f"  {line}" for line in quoted)
     return out
 
 
@@ -79,7 +86,21 @@ def render_report(result: ReviewResult) -> str:
     lines.append("")
     for p in result.passes:
         if p.name is PassName.CONSOLIDATION:
-            lines.append("- consolidation: merged duplicates and ranked the findings for display")
+            # Branched on the status, not assumed: a failed consolidation no longer makes the run
+            # incomplete, so this line is now reachable on a degraded run -- and it is the only
+            # thing the report says about consolidation. Claiming it ranked the findings when it
+            # did not would be a false statement about the artifact, and consolidation is
+            # prompted with the diff, so a contributor can reach that path.
+            if p.status is PassStatus.FAILED:
+                reasons = ", ".join(p.reasons)
+                lines.append(
+                    f"- consolidation: did not complete ({reasons});"
+                    " the findings below are neither merged nor ranked"
+                )
+            else:
+                lines.append(
+                    "- consolidation: merged duplicates and ranked the findings for display"
+                )
             continue
         note = ""
         if p.status is PassStatus.REJECTED:
@@ -93,9 +114,13 @@ def render_report(result: ReviewResult) -> str:
         lines.append("")
         for item in result.presented:
             lines.extend(_item(item))
-        if result.omitted:
+        # Counted over the findings, not the display items: a merged group shows several, so
+        # counting trimmed items would undercount what is on record and not shown.
+        shown = sum(1 + len(item.merged) for item in result.presented)
+        unshown = len(result.recorded) - shown
+        if unshown > 0:
             lines.append("")
-            lines.append(f"{result.omitted} further finding(s) are on record and not shown here.")
+            lines.append(f"{unshown} further finding(s) are on record and not shown here.")
     body = "\n".join(lines) + "\n"
     assert_body_safe(body)
     return body

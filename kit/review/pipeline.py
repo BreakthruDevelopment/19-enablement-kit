@@ -128,6 +128,9 @@ class ReviewResult:
         could make it fail would otherwise have a one-call route to silencing the whole report.
         When it fails, the presented set is simply unranked.
         """
+        # An allowlist, not "every pass but consolidation": a pass added to `PassName` and not to
+        # `FINDING_PASSES` would be silently excluded from completeness, so the two lists are
+        # meant to be read together.
         return not any(
             p.status is PassStatus.FAILED and p.name in FINDING_PASSES for p in self.passes
         )

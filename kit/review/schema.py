@@ -35,7 +35,16 @@ class PassOverflow(Exception):
     pass talked into listing nits would then silence a run in which another pass recorded a
     critical finding, which is the injection-to-silence attack the per-pass cap exists to defeat.
     So the over-bound case is raised here and rejected like any other overflow.
+
+    It carries the first `MAX_FINDINGS_SCHEMA` findings, validated, when the rest of the object is
+    well formed: the spec keeps a rejected pass's findings in the recorded set because dropping
+    them would reward overflow, and that has to hold at 51 as it does at 41. `output` is `None`
+    only when the object is invalid for some other reason too.
     """
+
+    def __init__(self, output: PassOutput | None) -> None:
+        super().__init__("more findings than the schema allows")
+        self.output = output
 
 
 __all__ = [
@@ -46,6 +55,7 @@ __all__ = [
     "Finding",
     "Group",
     "PassOutput",
+    "PassOverflow",
     "parse_consolidation_output",
     "parse_pass_output",
 ]
@@ -130,8 +140,9 @@ def parse_pass_output(text: str) -> PassOutput | None:
     if data is None:
         return None
     findings_value = data.get("findings")
-    if isinstance(findings_value, list) and len(findings_value) > MAX_FINDINGS_SCHEMA:
-        raise PassOverflow
+    overflowed = isinstance(findings_value, list) and len(findings_value) > MAX_FINDINGS_SCHEMA
+    if overflowed and isinstance(findings_value, list):
+        data["findings"] = findings_value[:MAX_FINDINGS_SCHEMA]
     for key in _DISCARDED:
         data.pop(key, None)
     findings = data.get("findings")
@@ -141,9 +152,14 @@ def parse_pass_output(text: str) -> PassOutput | None:
                 for key in _DISCARDED:
                     item.pop(key, None)
     try:
-        return PassOutput.model_validate(data)
+        output = PassOutput.model_validate(data)
     except ValidationError:
+        if overflowed:
+            raise PassOverflow(None) from None
         return None
+    if overflowed:
+        raise PassOverflow(output)
+    return output
 
 
 def parse_consolidation_output(text: str) -> ConsolidationOutput | None:
