@@ -14,6 +14,20 @@ def test_every_code_has_a_category_and_renders() -> None:
         assert "{" not in err.message
 
 
+def test_a_filesystem_refusal_is_internal_not_permission() -> None:
+    # `permission` is reserved for the Proxy's own rules, so a brief never reads as though the kit
+    # refused something the operating system did.
+    for code in (
+        ErrorCode.PATH_UNREADABLE,
+        ErrorCode.DIRECTORY_UNREADABLE,
+        ErrorCode.READ_FAILED,
+        ErrorCode.WRITE_FAILED,
+    ):
+        assert _build(code).category is ErrorCategory.INTERNAL
+    for code in (ErrorCode.OUTSIDE_ROOT, ErrorCode.DENIED_NAME, ErrorCode.WRITE_THROUGH_LINK):
+        assert _build(code).category is ErrorCategory.PERMISSION
+
+
 def test_only_transient_is_retryable() -> None:
     # Nothing the foundation refuses is transient: a cap, a deny-list name and a root are the same
     # next time, so a retry is wrong rather than unlucky.

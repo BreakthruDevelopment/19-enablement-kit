@@ -29,6 +29,9 @@ _STRICT = ConfigDict(extra="forbid", frozen=True)
 
 DEFAULT_CONFIG_FILENAME: Final = "kit.toml"
 
+# Neither file is large; a bound means a huge or wrong file is refused rather than parsed.
+_MAX_CONFIG_BYTES: Final = 256 * 1024
+
 
 class SandboxLimits(BaseModel):
     """The sandbox's three caps. Exceeding one is a `business` error, never a truncated read."""
@@ -73,6 +76,8 @@ class Config(BaseModel):
         `config.invalid` if a field is wrong.
         """
         try:
+            if path.stat().st_size > _MAX_CONFIG_BYTES:
+                raise KitError(ErrorCode.CONFIG_UNREADABLE)
             raw = path.read_bytes()
         except OSError as err:
             raise KitError(ErrorCode.CONFIG_UNREADABLE) from err

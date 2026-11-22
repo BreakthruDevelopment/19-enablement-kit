@@ -43,16 +43,21 @@ is a claim about the past, and a file that grew in between would otherwise be se
 is served: the rules the spec sets out resolve symlinks and match the deny list against the segments
 of the resolved path, and a hard link has no second path to match, so `notes.txt` hard-linked to
 `<root>/.env` reads as itself. Closing it would mean refusing any file with `st_nlink > 1`, which is
-a rule the spec does not state, so the limitation is recorded here and in the run log instead of
-being closed on a builder's own authority; 19.8 owns the brief's "no secret-shaped string" test and
-is where a content-level check belongs. Second, the **resolve-then-open** window is narrowed, not
-removed: the path is resolved by name and then opened by name, so a component *above* the file can
-be swapped in between. `O_NOFOLLOW` and the `fstat` close that window for the final component, which
-is the one an untrusted checkout can plant.
+a rule the spec does not state, so the limitation is recorded here, and in the pull request that
+introduced it, instead of being closed on a builder's own authority. A test pins it, so a later
+slice changes it deliberately rather than by accident; 19.8 owns the brief's "no secret-shaped
+string" test and is where a content-level check belongs.
+
+Second, the **resolve-then-open** window is narrowed, not removed: the path is resolved by name and
+then opened by name, so a component *above* the file can be swapped in between. `O_NOFOLLOW` and
+the `fstat` close that window for the final component, which is the one an untrusted checkout can
+plant.
 """
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import os
 import stat as stat_module
 from collections.abc import Iterable, Mapping, Sequence
@@ -65,7 +70,7 @@ from typing import NoReturn
 from agent_container.core.tool import ErrorCategory
 
 from kit.core.config import SandboxLimits
-from kit.core.errors import ErrorCode, KitError
+from kit.core.errors import ErrorCode, KitError, safe_token
 from kit.core.principals import Capability, Principal, assert_can
 
 __all__ = ["DENY_PATTERNS", "Refusal", "Sandbox", "Usage"]
@@ -148,6 +153,10 @@ class Sandbox:
 
     def _as_root(self, root: Path | str) -> Path:
         """A root, resolved once and confirmed to be a directory."""
+        if not str(root):
+            # `realpath("")` is the working directory; rooting a sandbox there silently is not a
+            # reasonable reading of an empty string.
+            raise KitError(ErrorCode.BAD_ROOT)
         real = self._real(root)
         status = self._status(real)
         if status is None or not stat_module.S_ISDIR(status.st_mode):
@@ -192,7 +201,7 @@ class Sandbox:
             try:
                 status = os.fstat(descriptor)
             except OSError as err:
-                self._refuse(ErrorCode.UNREADABLE, cause=err, encoding="bytes")
+                self._refuse(ErrorCode.READ_FAILED, cause=err)
             # Checked on the descriptor, not by name: this is the file that will be read, whatever
             # the name pointed at a moment ago.
             if not stat_module.S_ISREG(status.st_mode):
@@ -204,9 +213,11 @@ class Sandbox:
             try:
                 data = _read_up_to(descriptor, allowance + 1)
             except OSError as err:
-                self._refuse(ErrorCode.UNREADABLE, cause=err, encoding="bytes")
+                self._refuse(ErrorCode.READ_FAILED, cause=err)
         finally:
-            os.close(descriptor)
+            # A close failure on a read descriptor costs nothing and must not mask a refusal
+            # raised inside the block above.
+            _close_quietly(descriptor)
         served = len(data)
         if served > limits.max_file_bytes:
             self._refuse(
@@ -232,7 +243,9 @@ class Sandbox:
         try:
             return data.decode(encoding)
         except (UnicodeDecodeError, LookupError) as err:
-            self._refuse(ErrorCode.UNREADABLE, cause=err, encoding=_safe_encoding(encoding))
+            self._refuse(
+                ErrorCode.UNREADABLE, cause=err, encoding=safe_token(encoding, fallback="text")
+            )
 
     def list_dir(self, path: Path | str) -> tuple[Path, ...]:
         """The children of a directory, resolved, sorted, with denied and escaping ones removed.
@@ -251,13 +264,16 @@ class Sandbox:
         except OSError as err:
             # An unreadable directory is a refusal on the record, not an exception carrying its
             # path: `coverage.unread_reason` is where a caller must be able to report it.
-            self._refuse(ErrorCode.UNREADABLE, cause=err, encoding="directory")
+            self._refuse(ErrorCode.DIRECTORY_UNREADABLE, cause=err)
         kept: set[Path] = set()
         for child in children:
             try:
-                kept.add(self._check_path(child))
+                resolved = self._check_path(child)
             except KitError:
                 continue
+            if resolved == real:
+                continue  # a link back to the directory itself is not one of its children
+            kept.add(resolved)
         # Deduplicated: two links to one file are one entry, or a caller counting
         # `coverage.files_total` from a listing would overcount.
         return tuple(sorted(kept))
@@ -286,7 +302,12 @@ class Sandbox:
                 # brief names unexplored ground, so the rest of the tree still has to be counted.
                 continue
             for child in children:
-                child_status = self._status(child)
+                try:
+                    child_status = self._status(child)
+                except KitError:
+                    # Recorded by `_status`. An unresolvable symlink cycle or an unreadable child
+                    # must not end the walk either: this is the whole point of walking.
+                    continue
                 if child_status is None:
                     continue  # it went away between the listing and the look
                 if stat_module.S_ISDIR(child_status.st_mode):
@@ -332,10 +353,15 @@ class Sandbox:
         try:
             data = content.encode(encoding)
         except (UnicodeEncodeError, LookupError) as err:
-            self._refuse(ErrorCode.BAD_ENCODING, cause=err, encoding=_safe_encoding(encoding))
+            self._refuse(
+                ErrorCode.BAD_ENCODING, cause=err, encoding=safe_token(encoding, fallback="text")
+            )
         limit = self._limits.max_file_bytes
         if len(data) > limit:
             self._refuse(ErrorCode.FILE_BYTE_CAP, cap="max_file_bytes", limit=limit, size=len(data))
+        parent_status = self._status(real.parent)
+        if parent_status is not None and not stat_module.S_ISDIR(parent_status.st_mode):
+            self._refuse(ErrorCode.NOT_A_DIRECTORY)
         try:
             real.parent.mkdir(parents=True, exist_ok=True)
             # `O_NOFOLLOW` as well: the link check above is by name, and this is the open itself.
@@ -347,11 +373,17 @@ class Sandbox:
         except OSError as err:
             self._refuse(ErrorCode.WRITE_FAILED, cause=err)
         try:
-            os.write(descriptor, data)
+            _write_all(descriptor, data)
+        except OSError as err:
+            _close_quietly(descriptor)
+            self._refuse(ErrorCode.WRITE_FAILED, cause=err)
+        try:
+            # Not in a `finally`: a deferred `ENOSPC` or `EIO` surfaces here, after the last
+            # `write` returned, and a scaffold that reports success on a truncated file is worse
+            # than one that fails.
+            os.close(descriptor)
         except OSError as err:
             self._refuse(ErrorCode.WRITE_FAILED, cause=err)
-        finally:
-            os.close(descriptor)
         return real
 
     # -- checks -----------------------------------------------------------------------------
@@ -380,7 +412,7 @@ class Sandbox:
         except (FileNotFoundError, NotADirectoryError):
             return None
         except (OSError, ValueError) as err:
-            self._refuse(ErrorCode.UNREADABLE, cause=err, encoding="path")
+            self._refuse(ErrorCode.PATH_UNREADABLE, cause=err)
 
     def _check_path(self, path: Path | str) -> Path:
         """Resolve, then the allowlist, then the deny list. Shared by reads and listings."""
@@ -461,7 +493,16 @@ def _within(candidate: Path, root: Path) -> bool:
     return candidate == root or candidate.is_relative_to(root)
 
 
-def _safe_encoding(encoding: str) -> str:
-    """An encoding name is an argument, so it is checked before it reaches an error message."""
-    cleaned = encoding.strip().lower()
-    return cleaned if cleaned.replace("-", "").replace("_", "").isalnum() else "text"
+def _write_all(descriptor: int, data: bytes) -> None:
+    """Write every byte, because `write` may take fewer than it was given."""
+    written = 0
+    while written < len(data):
+        taken = os.write(descriptor, data[written:])
+        if taken <= 0:  # pragma: no cover -- POSIX forbids it; a refusal beats a silent loop
+            raise OSError(errno.EIO, "the write made no progress")
+        written += taken
+
+
+def _close_quietly(descriptor: int) -> None:
+    with contextlib.suppress(OSError):
+        os.close(descriptor)

@@ -150,3 +150,11 @@ def test_the_contract_model_is_frozen() -> None:
 def test_the_frozen_file_is_formatted_so_a_drift_is_a_readable_diff() -> None:
     raw = FROZEN.read_text()
     assert raw == json.dumps(json.loads(raw), indent=2) + "\n"
+
+
+def test_an_oversized_contract_is_refused_before_it_is_parsed(tmp_path: Path) -> None:
+    path = tmp_path / "p2p-erp.json"
+    path.write_text(json.dumps({"padding": "x" * 300_000}))
+    with pytest.raises(KitError) as caught:
+        load_contract(path)
+    assert caught.value.code is ErrorCode.CONTRACT_UNREADABLE

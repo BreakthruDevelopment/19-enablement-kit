@@ -101,3 +101,11 @@ def test_an_empty_gateway_command_is_refused() -> None:
         Config.from_mapping({"gateway": {"command": ""}})
     assert caught.value.detail["field"] == "gateway.command"
     assert GatewayConfig().command == "p2p-erp"
+
+
+def test_an_oversized_config_is_refused_before_it_is_parsed(tmp_path: Path) -> None:
+    path = tmp_path / "kit.toml"
+    path.write_text("# padding\n" * 40_000)
+    with pytest.raises(KitError) as caught:
+        Config.from_toml(path)
+    assert caught.value.code is ErrorCode.CONFIG_UNREADABLE

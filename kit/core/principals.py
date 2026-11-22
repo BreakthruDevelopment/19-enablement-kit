@@ -9,6 +9,10 @@ sessions in this repo, so this module is the whole of its authorization:
 | `ci`       | the headless reviewer in GitHub Actions     |
 | `lead`     | the engineer rolling the kit out            |
 
+There is one capability per command in the spec's command table, declared here even where the
+command itself arrives in a later slice: `kit/core/` is a foundation path, so a later slice needing
+a capability would otherwise have to stop and ask for a foundation change.
+
 `ci` is deliberately the weakest: it runs unattended on contributor-supplied content, so it may
 read the checkout and post its one report, and nothing else. It holds no credential but the
 model's, cannot write the working tree and -- the control that matters most in this repo -- cannot
@@ -54,6 +58,7 @@ class Capability(StrEnum):
     READ_FILES = "read_files"  # read through the sandbox Proxy
     RUN_SCOUT = "run_scout"  # explore a codebase and write a brief
     RUN_REVIEW = "run_review"  # the review passes over a diff
+    RUN_PLAN = "run_plan"  # `kit plan`: the same task planned first versus executed directly
     POST_REVIEW = "post_review"  # post the one report on a pull request
     CALL_GATEWAY = "call_gateway"  # one read call through the MCP client
     MANAGE_OWN_SESSIONS = "manage_own_sessions"  # list, resume, fork -- own sessions only
@@ -78,6 +83,7 @@ _ENGINEER: frozenset[Capability] = frozenset(
         Capability.READ_FILES,
         Capability.RUN_SCOUT,
         Capability.RUN_REVIEW,
+        Capability.RUN_PLAN,
         Capability.CALL_GATEWAY,
         Capability.MANAGE_OWN_SESSIONS,
     }

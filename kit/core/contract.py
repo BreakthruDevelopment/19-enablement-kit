@@ -26,6 +26,9 @@ __all__ = ["ContractTool", "ErrorShape", "GatewayContract", "ServerInfo", "load_
 
 _STRICT = ConfigDict(extra="forbid", frozen=True)
 
+# The frozen contract is a few kilobytes; a bound means a wrong file is refused, not parsed.
+_MAX_CONTRACT_BYTES = 256 * 1024
+
 # The five app-17 categories, in app 17's own order. The frozen contract must name exactly these:
 # app 18 maps every gateway error onto one of them, and a copy that drifted would be worse than no
 # copy at all.
@@ -111,6 +114,8 @@ def load_contract(path: Path) -> GatewayContract:
     `contract.invalid` if it does not match the schema. Neither message quotes the file.
     """
     try:
+        if path.stat().st_size > _MAX_CONTRACT_BYTES:
+            raise KitError(ErrorCode.CONTRACT_UNREADABLE)
         raw = path.read_bytes()
     except OSError as err:
         raise KitError(ErrorCode.CONTRACT_UNREADABLE) from err

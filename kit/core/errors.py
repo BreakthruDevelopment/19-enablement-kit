@@ -36,6 +36,9 @@ class ErrorCode(StrEnum):
     NOT_A_FILE = "sandbox.not_a_file"
     NOT_A_DIRECTORY = "sandbox.not_a_directory"
     UNREADABLE = "sandbox.unreadable"
+    PATH_UNREADABLE = "sandbox.path_unreadable"
+    DIRECTORY_UNREADABLE = "sandbox.directory_unreadable"
+    READ_FAILED = "sandbox.read_failed"
     WRITE_FORBIDDEN = "sandbox.write_forbidden"
     WRITE_THROUGH_LINK = "sandbox.write_through_link"
     WRITE_FAILED = "sandbox.write_failed"
@@ -96,6 +99,14 @@ _SPEC: Mapping[ErrorCode, _Spec] = MappingProxyType(
             ErrorCategory.PERMISSION,
             "the destination is a symbolic link: a write is never followed through one",
         ),
+        # These four are `internal`: the filesystem said no for a reason that is not one of the
+        # Proxy's own rules. `permission` stays reserved for the rules in this module, so a brief
+        # never reads as though the kit refused something the operating system did.
+        ErrorCode.PATH_UNREADABLE: _Spec(ErrorCategory.INTERNAL, "the path could not be examined"),
+        ErrorCode.DIRECTORY_UNREADABLE: _Spec(
+            ErrorCategory.INTERNAL, "the directory could not be listed"
+        ),
+        ErrorCode.READ_FAILED: _Spec(ErrorCategory.INTERNAL, "the file could not be read"),
         ErrorCode.WRITE_FAILED: _Spec(ErrorCategory.INTERNAL, "the file could not be written"),
         ErrorCode.BAD_ENCODING: _Spec(
             ErrorCategory.VALIDATION,

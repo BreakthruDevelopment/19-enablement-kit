@@ -606,9 +606,10 @@ def test_an_unreadable_directory_is_a_refusal_not_an_exception(
     _refuse_iterdir(monkeypatch, "locked")
     with pytest.raises(KitError) as caught:
         box.list_dir(root / "locked")
-    assert caught.value.code is ErrorCode.UNREADABLE
+    assert caught.value.code is ErrorCode.DIRECTORY_UNREADABLE
+    assert caught.value.category.value == "internal"
     assert str(root) not in caught.value.message
-    assert box.refusals[-1].code is ErrorCode.UNREADABLE
+    assert box.refusals[-1].code is ErrorCode.DIRECTORY_UNREADABLE
 
 
 def test_walk_carries_on_past_an_unreadable_directory_and_records_it(
@@ -623,7 +624,7 @@ def test_walk_carries_on_past_an_unreadable_directory_and_records_it(
     _refuse_iterdir(monkeypatch, "locked")
     found = [path.relative_to(root).as_posix() for path in box.walk(root)]
     assert found == ["README.md", "src/Main.java"]
-    assert ErrorCode.UNREADABLE in {refusal.code for refusal in box.refusals}
+    assert ErrorCode.DIRECTORY_UNREADABLE in {refusal.code for refusal in box.refusals}
 
 
 def test_a_path_that_cannot_be_resolved_is_a_refusal(tmp_path: Path) -> None:
@@ -677,7 +678,7 @@ def test_an_unusable_name_is_a_refusal_on_every_read_path(tmp_path: Path) -> Non
     ):
         with pytest.raises(KitError) as caught:
             call()
-        assert caught.value.code is ErrorCode.UNREADABLE
+        assert caught.value.code is ErrorCode.PATH_UNREADABLE
         assert str(root) not in caught.value.message
         assert _TOO_LONG not in caught.value.message
     # Each one is on the record, so `coverage.unread_reason` can name it.
@@ -691,7 +692,7 @@ def test_an_unusable_name_is_a_refusal_on_the_write_path(tmp_path: Path) -> None
     box = Sandbox(Principal.lead("lead"), [root], write_root=target)
     with pytest.raises(KitError) as caught:
         box.write_text(_TOO_LONG, "x\n")
-    assert caught.value.code is ErrorCode.UNREADABLE
+    assert caught.value.code is ErrorCode.PATH_UNREADABLE
     assert _TOO_LONG not in caught.value.message
 
 
@@ -762,3 +763,150 @@ def test_a_descriptor_that_is_not_a_regular_file_is_refused(
         box.read_bytes(root / "README.md")
     assert caught.value.code is ErrorCode.NOT_A_FILE
     assert box.usage == Usage(files_read=0, bytes_read=0)
+
+
+# -- third review: the walk must finish, and a write must be whole ----------------------------
+
+
+def test_walk_carries_on_past_an_unresolvable_symlink_cycle(tmp_path: Path) -> None:
+    # No monkeypatch and no privileges: `realpath` leaves a two-link cycle unresolved, so the
+    # child's `stat` is an ELOOP, and that must not end the walk.
+    root = _tree(tmp_path / "repo")
+    (root / "loopa").symlink_to(root / "loopb")
+    (root / "loopb").symlink_to(root / "loopa")
+    box = _sandbox(root)
+    found = [path.relative_to(root).as_posix() for path in box.walk(root)]
+    assert found == ["README.md", "src/Main.java"]
+    assert ErrorCode.PATH_UNREADABLE in {refusal.code for refusal in box.refusals}
+
+
+def test_a_link_to_the_directory_itself_is_not_one_of_its_children(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    (root / "self").symlink_to(root, target_is_directory=True)
+    box = _sandbox(root)
+    assert root not in box.list_dir(root)
+    assert [path.relative_to(root).as_posix() for path in box.walk(root)] == [
+        "README.md",
+        "src/Main.java",
+    ]
+
+
+def test_a_short_write_is_finished_not_reported_as_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `write` may take fewer bytes than it is given. Discarding the count left a truncated file
+    # reported as a successful scaffold write.
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    target.mkdir()
+    box = Sandbox(Principal.lead("lead"), [root], write_root=target)
+    real_write = os.write
+    calls: list[int] = []
+
+    def grudging(fd: int, data: bytes) -> int:
+        taken = real_write(fd, data[:1])
+        calls.append(taken)
+        return taken
+
+    monkeypatch.setattr(os, "write", grudging)
+    written = box.write_text("CLAUDE.md", "# rules\n")
+    monkeypatch.undo()
+    assert written.read_text() == "# rules\n"
+    assert len(calls) == len("# rules\n")
+
+
+def test_a_failed_write_is_a_refusal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    target.mkdir()
+    box = Sandbox(Principal.lead("lead"), [root], write_root=target)
+
+    def no_space(fd: int, data: bytes) -> int:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "write", no_space)
+    with pytest.raises(KitError) as caught:
+        box.write_text("CLAUDE.md", "# rules\n")
+    assert caught.value.code is ErrorCode.WRITE_FAILED
+    assert caught.value.category.value == "internal"
+
+
+def test_a_failed_close_is_a_refusal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A deferred ENOSPC surfaces at `close`, after the last `write` returned, so a `finally` that
+    # swallowed it would report a truncated file as written.
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    target.mkdir()
+    box = Sandbox(Principal.lead("lead"), [root], write_root=target)
+    real_close = os.close
+
+    def failing(fd: int) -> None:
+        real_close(fd)
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "close", failing)
+    with pytest.raises(KitError) as caught:
+        box.write_text("CLAUDE.md", "# rules\n")
+    monkeypatch.undo()
+    assert caught.value.code is ErrorCode.WRITE_FAILED
+
+
+def test_a_close_failure_on_a_read_does_not_mask_the_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _tree(tmp_path / "repo")
+    box = _sandbox(root)
+    real_close = os.close
+
+    def failing(fd: int) -> None:
+        real_close(fd)
+        raise OSError(5, "I/O error")
+
+    monkeypatch.setattr(os, "close", failing)
+    content = box.read_text(root / "README.md")
+    monkeypatch.undo()
+    assert content == "# oms\n"
+
+
+@pytest.mark.parametrize("encoding", ["café", "n" * 65, "", "utf-8-but-not-really"])
+def test_an_unusable_encoding_name_is_still_a_refusal(tmp_path: Path, encoding: str) -> None:
+    # The encoding is an argument, so it reaches a message only through the one sanitiser in
+    # `errors`. A sanitiser of its own let a name through that `KitError` then refused, turning a
+    # refusal into a `ValueError` with nothing recorded.
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    target.mkdir()
+    box = Sandbox(Principal.lead("lead"), [root], write_root=target)
+    with pytest.raises(KitError) as caught:
+        box.write_text("CLAUDE.md", "hi", encoding=encoding)
+    assert caught.value.code is ErrorCode.BAD_ENCODING
+    # Either the name is a safe token and is quoted, or it is replaced by the fallback -- never
+    # interpolated raw, and never a `ValueError` out of `KitError` instead of a refusal.
+    assert "text" in caught.value.message or encoding in caught.value.message
+
+
+def test_an_unusable_encoding_name_on_a_read_is_still_a_refusal(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    with pytest.raises(KitError) as caught:
+        _sandbox(root).read_text(root / "README.md", encoding="n" * 65)
+    assert caught.value.code is ErrorCode.UNREADABLE
+
+
+def test_a_write_needs_a_directory_for_a_parent(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "notes.md").write_text("a file, not a directory\n")
+    box = Sandbox(Principal.lead("lead"), [root], write_root=target)
+    with pytest.raises(KitError) as caught:
+        box.write_text("notes.md/CLAUDE.md", "x\n")
+    assert caught.value.code is ErrorCode.NOT_A_DIRECTORY
+    assert (target / "notes.md").read_text() == "a file, not a directory\n"
+
+
+def test_an_empty_root_is_not_the_working_directory(tmp_path: Path) -> None:
+    candidates: list[list[Path | str]] = [[""], [tmp_path / "repo", ""]]
+    for roots in candidates:
+        with pytest.raises(KitError) as caught:
+            Sandbox(Principal.engineer("dev"), roots)
+        assert caught.value.code is ErrorCode.BAD_ROOT

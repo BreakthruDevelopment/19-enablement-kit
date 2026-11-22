@@ -120,3 +120,17 @@ def test_a_subject_is_a_short_token(subject: str) -> None:
 
 def test_capabilities_are_immutable() -> None:
     assert isinstance(Principal.ci().capabilities, frozenset)
+
+
+def test_there_is_a_capability_for_every_command_in_the_spec() -> None:
+    # `kit/core/` is a foundation path, so a later slice that found its command had no capability
+    # would have to stop and ask for a foundation change. The table is declared up front instead.
+    dev = Principal.engineer("dev")
+    for capability in (Capability.RUN_SCOUT, Capability.RUN_REVIEW, Capability.RUN_PLAN):
+        assert_can(dev, capability)
+    assert_can(dev, Capability.CALL_GATEWAY)
+    assert_can(dev, Capability.MANAGE_OWN_SESSIONS, owner="dev")
+    assert_can(Principal.lead("lead"), Capability.WRITE_TARGET)
+    # Not CI's: a plan is an engineer at their own machine.
+    with pytest.raises(KitError):
+        assert_can(Principal.ci(), Capability.RUN_PLAN)
