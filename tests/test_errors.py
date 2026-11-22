@@ -72,6 +72,7 @@ def test_safe_token_falls_back_rather_than_leaking() -> None:
 _SAMPLES: dict[ErrorCode, dict[str, int | str]] = {
     ErrorCode.DENIED_NAME: {"pattern": ".env*"},
     ErrorCode.UNREADABLE: {"encoding": "utf-8"},
+    ErrorCode.BAD_ENCODING: {"encoding": "ascii"},
     ErrorCode.FILE_BYTE_CAP: {"cap": "max_file_bytes", "limit": 1, "size": 2},
     ErrorCode.RUN_BYTE_CAP: {"cap": "max_run_bytes", "limit": 1, "spent": 1, "size": 2},
     ErrorCode.FILE_COUNT_CAP: {"cap": "max_files", "limit": 1},

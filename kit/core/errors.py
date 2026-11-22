@@ -38,6 +38,8 @@ class ErrorCode(StrEnum):
     UNREADABLE = "sandbox.unreadable"
     WRITE_FORBIDDEN = "sandbox.write_forbidden"
     WRITE_THROUGH_LINK = "sandbox.write_through_link"
+    WRITE_FAILED = "sandbox.write_failed"
+    BAD_ENCODING = "sandbox.bad_encoding"
     BAD_PATH = "sandbox.bad_path"
     FILE_BYTE_CAP = "sandbox.file_byte_cap"
     RUN_BYTE_CAP = "sandbox.run_byte_cap"
@@ -93,6 +95,12 @@ _SPEC: Mapping[ErrorCode, _Spec] = MappingProxyType(
         ErrorCode.WRITE_THROUGH_LINK: _Spec(
             ErrorCategory.PERMISSION,
             "the destination is a symbolic link: a write is never followed through one",
+        ),
+        ErrorCode.WRITE_FAILED: _Spec(ErrorCategory.INTERNAL, "the file could not be written"),
+        ErrorCode.BAD_ENCODING: _Spec(
+            ErrorCategory.VALIDATION,
+            "the content cannot be encoded as {encoding}",
+            ("encoding",),
         ),
         ErrorCode.BAD_PATH: _Spec(
             ErrorCategory.VALIDATION, "the path cannot be resolved on this filesystem"

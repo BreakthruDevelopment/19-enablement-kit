@@ -128,26 +128,31 @@ class Sandbox:
         write_root: Path | str | None = None,
     ) -> None:
         assert_can(principal, Capability.READ_FILES)
-        if not roots:
-            raise KitError(ErrorCode.BAD_ROOT)
-        resolved: list[Path] = []
-        for root in roots:
-            real = _real(root)
-            if not real.is_dir():
-                raise KitError(ErrorCode.BAD_ROOT)
-            resolved.append(real)
+        # The counters come first: resolving a root can itself refuse, and `_refuse` records.
         self._principal = principal
-        self._roots: tuple[Path, ...] = tuple(resolved)
         self._limits = limits if limits is not None else SandboxLimits()
-        self._write_root: Path | None = None
-        if write_root is not None:
-            real_write = _real(write_root)
-            if not real_write.is_dir():
-                raise KitError(ErrorCode.BAD_ROOT)
-            self._write_root = real_write
         self._files: set[Path] = set()
         self._bytes = 0
         self._refusals: list[Refusal] = []
+        if not roots:
+            raise KitError(ErrorCode.BAD_ROOT)
+        try:
+            self._roots: tuple[Path, ...] = tuple(self._as_root(root) for root in roots)
+            self._write_root: Path | None = (
+                None if write_root is None else self._as_root(write_root)
+            )
+        except KitError as err:
+            # A root is the caller's own configuration, not untrusted input, so every way it can
+            # be wrong -- missing, a file, unreadable, unresolvable -- is one error.
+            raise KitError(ErrorCode.BAD_ROOT) from err
+
+    def _as_root(self, root: Path | str) -> Path:
+        """A root, resolved once and confirmed to be a directory."""
+        real = self._real(root)
+        status = self._status(real)
+        if status is None or not stat_module.S_ISDIR(status.st_mode):
+            raise KitError(ErrorCode.BAD_ROOT)
+        return real
 
     # -- what the run has spent, and what it was refused ------------------------------------
 
@@ -178,7 +183,9 @@ class Sandbox:
         real = self._check_read(path)
         limits = self._limits
         try:
-            descriptor = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            # `O_NONBLOCK` as well: `O_RDONLY` on a fifo blocks in the open, before `fstat`
+            # could refuse it, and a CLI run has no timeout. It costs a regular file nothing.
+            descriptor = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
         except OSError as err:
             self._refuse(ErrorCode.UNREADABLE, cause=err, encoding="bytes")
         try:
@@ -234,7 +241,10 @@ class Sandbox:
         not. Listing charges no cap: nothing is opened.
         """
         real = self._check_path(path)
-        if not real.is_dir():
+        status = self._status(real)
+        if status is None:
+            self._refuse(ErrorCode.MISSING)
+        if not stat_module.S_ISDIR(status.st_mode):
             self._refuse(ErrorCode.NOT_A_DIRECTORY)
         try:
             children = sorted(real.iterdir())
@@ -259,7 +269,10 @@ class Sandbox:
         `coverage` before deciding what to spend its byte budget on.
         """
         start = self._check_path(path)
-        if not start.is_dir():
+        start_status = self._status(start)
+        if start_status is None:
+            self._refuse(ErrorCode.MISSING)
+        if not stat_module.S_ISDIR(start_status.st_mode):
             self._refuse(ErrorCode.NOT_A_DIRECTORY)
         found: set[Path] = set()
         stack = [start]
@@ -273,11 +286,14 @@ class Sandbox:
                 # brief names unexplored ground, so the rest of the tree still has to be counted.
                 continue
             for child in children:
-                if child.is_dir():
+                child_status = self._status(child)
+                if child_status is None:
+                    continue  # it went away between the listing and the look
+                if stat_module.S_ISDIR(child_status.st_mode):
                     if child not in seen:
                         seen.add(child)
                         stack.append(child)
-                elif child.is_file():
+                elif stat_module.S_ISREG(child_status.st_mode):
                     found.add(child)
         return tuple(sorted(found))
 
@@ -301,7 +317,8 @@ class Sandbox:
         parent = target.parent if target.is_absolute() else write_root / target.parent
         real_parent = self._real(parent)
         candidate = real_parent / target.name
-        if candidate.is_symlink():
+        candidate_status = self._status(candidate, follow=False)
+        if candidate_status is not None and stat_module.S_ISLNK(candidate_status.st_mode):
             self._refuse(ErrorCode.WRITE_THROUGH_LINK)
         real = self._real(candidate)
         if not _within(real, write_root):
@@ -309,9 +326,13 @@ class Sandbox:
         denied = _denied_pattern(real.relative_to(write_root).parts)
         if denied is not None:
             self._refuse(ErrorCode.DENIED_NAME, pattern=denied)
-        if real.exists() and not real.is_file():
+        real_status = self._status(real)
+        if real_status is not None and not stat_module.S_ISREG(real_status.st_mode):
             self._refuse(ErrorCode.NOT_A_FILE)
-        data = content.encode(encoding)
+        try:
+            data = content.encode(encoding)
+        except (UnicodeEncodeError, LookupError) as err:
+            self._refuse(ErrorCode.BAD_ENCODING, cause=err, encoding=_safe_encoding(encoding))
         limit = self._limits.max_file_bytes
         if len(data) > limit:
             self._refuse(ErrorCode.FILE_BYTE_CAP, cap="max_file_bytes", limit=limit, size=len(data))
@@ -324,11 +345,11 @@ class Sandbox:
                 0o644,
             )
         except OSError as err:
-            self._refuse(ErrorCode.UNREADABLE, cause=err, encoding="bytes")
+            self._refuse(ErrorCode.WRITE_FAILED, cause=err)
         try:
             os.write(descriptor, data)
         except OSError as err:
-            self._refuse(ErrorCode.UNREADABLE, cause=err, encoding="bytes")
+            self._refuse(ErrorCode.WRITE_FAILED, cause=err)
         finally:
             os.close(descriptor)
         return real
@@ -346,6 +367,21 @@ class Sandbox:
         except (OSError, ValueError) as err:
             self._refuse(ErrorCode.BAD_PATH, cause=err)
 
+    def _status(self, path: Path, *, follow: bool = True) -> os.stat_result | None:
+        """`stat`, as a refusal rather than an exception, and `None` for "nothing there".
+
+        Every kind test in this module goes through here. `pathlib`'s `exists`, `is_file`,
+        `is_dir` and `is_symlink` swallow only a short list of errnos and re-raise the rest, so a
+        mode-000 parent directory or a name over `NAME_MAX` would otherwise leave a public method
+        as a bare `OSError` carrying the absolute path it was given -- and record no refusal.
+        """
+        try:
+            return os.stat(path, follow_symlinks=follow)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        except (OSError, ValueError) as err:
+            self._refuse(ErrorCode.UNREADABLE, cause=err, encoding="path")
+
     def _check_path(self, path: Path | str) -> Path:
         """Resolve, then the allowlist, then the deny list. Shared by reads and listings."""
         real = self._real(path)
@@ -359,9 +395,10 @@ class Sandbox:
 
     def _check_read(self, path: Path | str) -> Path:
         real = self._check_path(path)
-        if not real.exists():
+        status = self._status(real)
+        if status is None:
             self._refuse(ErrorCode.MISSING)
-        if not real.is_file():
+        if not stat_module.S_ISREG(status.st_mode):
             self._refuse(ErrorCode.NOT_A_FILE)
         return real
 

@@ -501,10 +501,16 @@ def test_a_write_over_a_directory_is_refused(tmp_path: Path) -> None:
     target = tmp_path / "target"
     (target / "docs").mkdir(parents=True)
     box = Sandbox(Principal.lead("lead"), [root], write_root=target)
-    for destination in ("docs", "docs/.."):
+    # `docs` is a directory inside the root; `docs/..` resolves to the root itself, which is one
+    # too; `..` leaves the root altogether.
+    for destination, code in (
+        ("docs", ErrorCode.NOT_A_FILE),
+        ("docs/..", ErrorCode.NOT_A_FILE),
+        ("..", ErrorCode.OUTSIDE_ROOT),
+    ):
         with pytest.raises(KitError) as caught:
             box.write_text(destination, "x\n")
-        assert caught.value.code in {ErrorCode.NOT_A_FILE, ErrorCode.OUTSIDE_ROOT}
+        assert caught.value.code is code
     assert (target / "docs").is_dir()
 
 
@@ -649,3 +655,110 @@ def test_a_hard_link_to_a_denied_file_is_served_and_that_is_known(tmp_path: Path
     (root / ".env").write_text("TOKEN=shh\n")
     os.link(root / ".env", root / "notes.txt")
     assert _sandbox(root).read_text(root / "notes.txt") == "TOKEN=shh\n"
+
+
+# -- and what the re-review found: a bare OSError is not a refusal ----------------------------
+
+# A name over NAME_MAX. `pathlib`'s `exists`, `is_file`, `is_dir` and `is_symlink` swallow only a
+# short list of errnos and re-raise the rest, so this reaches a public method as `OSError: [Errno
+# 36] File name too long: '<absolute path>'` unless every kind test is guarded. It needs no
+# privileges, which is why it stands in here for the mode-000 directory a non-root user meets.
+_TOO_LONG = "n" * 300
+
+
+def test_an_unusable_name_is_a_refusal_on_every_read_path(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    box = _sandbox(root)
+    for call in (
+        lambda: box.read_bytes(root / _TOO_LONG),
+        lambda: box.read_text(root / _TOO_LONG),
+        lambda: box.list_dir(root / _TOO_LONG),
+        lambda: box.walk(root / _TOO_LONG),
+    ):
+        with pytest.raises(KitError) as caught:
+            call()
+        assert caught.value.code is ErrorCode.UNREADABLE
+        assert str(root) not in caught.value.message
+        assert _TOO_LONG not in caught.value.message
+    # Each one is on the record, so `coverage.unread_reason` can name it.
+    assert len(box.refusals) == 4
+
+
+def test_an_unusable_name_is_a_refusal_on_the_write_path(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    target.mkdir()
+    box = Sandbox(Principal.lead("lead"), [root], write_root=target)
+    with pytest.raises(KitError) as caught:
+        box.write_text(_TOO_LONG, "x\n")
+    assert caught.value.code is ErrorCode.UNREADABLE
+    assert _TOO_LONG not in caught.value.message
+
+
+def test_a_root_that_cannot_be_used_is_a_bad_root(tmp_path: Path) -> None:
+    for root in (tmp_path / _TOO_LONG, Path("has\0nul")):
+        with pytest.raises(KitError) as caught:
+            Sandbox(Principal.engineer("dev"), [root])
+        assert caught.value.code is ErrorCode.BAD_ROOT
+        assert "nul" not in caught.value.message
+
+
+def test_a_write_root_that_cannot_be_used_is_a_bad_root(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    with pytest.raises(KitError) as caught:
+        Sandbox(Principal.lead("lead"), [root], write_root=tmp_path / _TOO_LONG)
+    assert caught.value.code is ErrorCode.BAD_ROOT
+
+
+def test_content_that_cannot_be_encoded_is_a_refusal(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    target.mkdir()
+    box = Sandbox(Principal.lead("lead"), [root], write_root=target)
+    with pytest.raises(KitError) as caught:
+        box.write_text("CLAUDE.md", "café", encoding="ascii")
+    assert caught.value.code is ErrorCode.BAD_ENCODING
+    assert caught.value.category.value == "validation"
+    with pytest.raises(KitError) as caught:
+        box.write_text("CLAUDE.md", "hi", encoding="no-such-codec")
+    assert caught.value.code is ErrorCode.BAD_ENCODING
+    with pytest.raises(KitError) as caught:
+        box.write_text("CLAUDE.md", "lone \ud800 surrogate")
+    assert caught.value.code is ErrorCode.BAD_ENCODING
+    assert not (target / "CLAUDE.md").exists()
+
+
+def test_a_descriptor_that_is_not_a_regular_file_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The kind test on the descriptor, not on the name: the only way to reach it is to have the
+    # file swapped between the resolve and the open, which is what this stands in for.
+    import stat as stat_module
+
+    root = _tree(tmp_path / "repo")
+    real_fstat = os.fstat
+
+    def as_fifo(fd: int) -> os.stat_result:
+        status = real_fstat(fd)
+        mode = (status.st_mode & ~stat_module.S_IFMT(status.st_mode)) | stat_module.S_IFIFO
+        return os.stat_result(
+            (
+                mode,
+                status.st_ino,
+                status.st_dev,
+                status.st_nlink,
+                status.st_uid,
+                status.st_gid,
+                status.st_size,
+                int(status.st_atime),
+                int(status.st_mtime),
+                int(status.st_ctime),
+            )
+        )
+
+    monkeypatch.setattr(os, "fstat", as_fifo)
+    box = _sandbox(root)
+    with pytest.raises(KitError) as caught:
+        box.read_bytes(root / "README.md")
+    assert caught.value.code is ErrorCode.NOT_A_FILE
+    assert box.usage == Usage(files_read=0, bytes_read=0)
