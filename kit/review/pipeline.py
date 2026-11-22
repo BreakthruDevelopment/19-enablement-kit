@@ -101,7 +101,6 @@ class ReviewResult:
     passes: tuple[PassResult, ...]
     recorded: tuple[RecordedFinding, ...]
     presented: tuple[PresentedFinding, ...]
-    omitted: int
     blocking: bool
 
     @property
@@ -256,6 +255,5 @@ async def run_review(
         passes=tuple(results),
         recorded=tuple(recorded),
         presented=presented[:MAX_PRESENTED],
-        omitted=max(0, len(presented) - MAX_PRESENTED),
         blocking=blocking,
     )

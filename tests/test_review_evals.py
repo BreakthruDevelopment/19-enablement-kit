@@ -36,7 +36,7 @@ from review_support import (
 )
 
 from kit.core.errors import ErrorCode, KitError
-from kit.core.principals import Principal
+from kit.core.principals import Capability, Principal
 from kit.review import (
     PassName,
     ReplayDirectory,
@@ -476,7 +476,6 @@ def test_display_is_trimmed_after_the_verdict_is_computed() -> None:
     assert result.verdict == "blocking"
     assert len(result.recorded) == 31
     assert len(result.presented) == 25
-    assert result.omitted == 6
     assert result.presented[0].lead.severity.value == "critical"
     assert "6 further finding(s) are on record" in render_report(result)
 
@@ -761,11 +760,14 @@ def test_a_degraded_run_does_not_claim_consolidation_ranked_anything() -> None:
     )
     degraded = render_report(run(demo_diff(), providers))
     assert "neither merged nor ranked" in degraded
-    assert "merged duplicates and ranked" not in degraded
+    assert "merged duplicates;" not in degraded
 
     providers, _ = scripted(security=reply([finding(SQLI_QUOTE, "SEC-1")]))
     ranked = render_report(run(demo_diff(), providers))
-    assert "merged duplicates and ranked" in ranked
+    assert "merged duplicates;" in ranked
+    # And the ok branch no longer credits consolidation with the ordering, which is by severity
+    # and then recorded index, in code.
+    assert "set in code" in ranked
     assert "neither merged nor ranked" not in ranked
 
 
@@ -851,7 +853,10 @@ def test_the_review_command_checks_the_capability(monkeypatch: pytest.MonkeyPatc
     # must be wired, or a tightened `ci` would bypass it silently.
     import kit.review.command as command_module
 
-    def refuse(*args: object, **kwargs: object) -> None:
+    asked: list[tuple[object, object]] = []
+
+    def refuse(principal: object, capability: object, **kwargs: object) -> None:
+        asked.append((principal, capability))
         raise KitError(ErrorCode.FORBIDDEN, role="ci", capability="run_review")
 
     monkeypatch.setattr(command_module, "assert_can", refuse)
@@ -866,3 +871,5 @@ def test_the_review_command_checks_the_capability(monkeypatch: pytest.MonkeyPatc
     )
     assert code == 2
     assert out.getvalue() == ""
+    # And that it asked for the right thing, not merely that it asked.
+    assert asked == [(Principal.ci(), Capability.RUN_REVIEW)]

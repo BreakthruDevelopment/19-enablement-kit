@@ -65,6 +65,15 @@ _PREFIX: Final[Mapping[PassName, str]] = MappingProxyType(
     }
 )
 
+# A criterion is a rule, written to be read by a person and applied by a pass. Its text is bounded
+# because `render()` goes into every pass's system prompt: `criteria/` is deliberately not a
+# foundation path, so a pull request can edit it, and without a cap four files could put several
+# hundred kilobytes into each of five calls. The cap is generous for a rule and small for a
+# payload.
+MAX_CRITERION_BYTES: Final = 2_000
+MAX_CRITERIA_BYTES: Final = 20_000
+MAX_CRITERIA_ENTRIES: Final = 40
+
 _HEADING = re.compile(
     r"\A## (?P<id>[A-Z]{3}-[0-9]{1,3}) \| (?P<severity>critical|major|minor) \| "
     r"(?P<title>\S.{0,118})\Z"
@@ -107,10 +116,12 @@ def parse_criteria(pass_name: PassName, text: str) -> Criteria:
         if current is None:
             return
         text_ = "\n".join(body).strip()
-        if not text_:
+        if not text_ or len(text_.encode("utf-8")) > MAX_CRITERION_BYTES:
             raise ReviewError(ReviewReason.CRITERIA_INVALID)
         entries.append(Criterion(current[0], current[1], current[2], text_))
 
+    if len(text.encode("utf-8")) > MAX_CRITERIA_BYTES:
+        raise ReviewError(ReviewReason.CRITERIA_INVALID)
     for line in text.splitlines():
         if line.startswith("## "):
             close()
@@ -125,7 +136,7 @@ def parse_criteria(pass_name: PassName, text: str) -> Criteria:
         elif current is not None:
             body.append(line)
     close()
-    if not entries:
+    if not entries or len(entries) > MAX_CRITERIA_ENTRIES:
         raise ReviewError(ReviewReason.CRITERIA_INVALID)
     return Criteria(pass_name, tuple(entries))
 

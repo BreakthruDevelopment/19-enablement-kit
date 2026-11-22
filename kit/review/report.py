@@ -36,8 +36,14 @@ def _one_line(text: str) -> str:
 
 
 def _quote(text: str) -> list[str]:
-    lines = normalise_terminators(text).split("\n")[:_MAX_QUOTE_LINES]
-    return [f"> {line}" for line in lines]
+    all_lines = normalise_terminators(text).split("\n")
+    lines = all_lines[:_MAX_QUOTE_LINES]
+    quoted = [f"> {line}" for line in lines]
+    if len(all_lines) > _MAX_QUOTE_LINES:
+        # Said rather than left silent: a quote cut without a marker reads like the whole of the
+        # evidence, which is the same class of mistake as a truncated read that looks complete.
+        quoted.append(f"> ... ({len(all_lines) - _MAX_QUOTE_LINES} more line(s) not shown)")
+    return quoted
 
 
 def _where(r: RecordedFinding) -> str:
@@ -99,7 +105,8 @@ def render_report(result: ReviewResult) -> str:
                 )
             else:
                 lines.append(
-                    "- consolidation: merged duplicates and ranked the findings for display"
+                    "- consolidation: merged duplicates; the display order is by severity"
+                    " and then by the order the findings were recorded, set in code"
                 )
             continue
         note = ""
