@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project name="harbor-oms" default="ear" basedir=".">
+  <!--
+    Harbor OMS. Compiles the desk sources and packs an EAR.
+    The Java EE libraries come from the app server, via J2EE_HOME.
+    Order DAO sources live at src/com/harbor/oms/dao.
+  -->
+  <property file="build.properties"/>
+  <property environment="env"/>
+  <property name="j2ee.lib" value="${env.J2EE_HOME}/lib/j2ee.jar"/>
+  <property name="build.dir" value="build"/>
+  <property name="classes.dir" value="${build.dir}/classes"/>
+
+  <target name="init">
+    <mkdir dir="${classes.dir}"/>
+  </target>
+
+  <target name="compile" depends="init">
+    <javac
+        srcdir="src"
+        destdir="${classes.dir}"
+        source="${java.source}"
+        target="${java.target}"
+        debug="on"
+        includeantruntime="false">
+      <classpath path="${j2ee.lib}"/>
+      <include name="com/harbor/oms/**/*.java"/>
+    </javac>
+  </target>
+
+  <target name="ejb-jar" depends="compile">
+    <jar destfile="${build.dir}/${ejb.jar}">
+      <fileset dir="${classes.dir}" includes="com/harbor/oms/**/*.class"/>
+      <metainf dir="dd" includes="ejb-jar.xml,weblogic-ejb-jar.xml"/>
+    </jar>
+  </target>
+
+  <target name="war" depends="compile">
+    <war destfile="${build.dir}/${web.war}" webxml="web/WEB-INF/web.xml">
+      <fileset dir="web" excludes="WEB-INF/web.xml"/>
+      <classes dir="${classes.dir}" includes="com/harbor/oms/web/**/*.class"/>
+      <classes dir="${classes.dir}" includes="com/harbor/oms/catalog/**/*.class"/>
+    </war>
+  </target>
+
+  <target name="ear" depends="ejb-jar,war">
+    <ear destfile="${build.dir}/${ear.name}" appxml="dd/application.xml">
+      <fileset dir="${build.dir}" includes="${ejb.jar},${web.war}"/>
+    </ear>
+  </target>
+
+  <target name="clean">
+    <delete dir="${build.dir}"/>
+  </target>
+</project>
