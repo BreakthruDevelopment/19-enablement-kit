@@ -37,6 +37,8 @@ class ErrorCode(StrEnum):
     NOT_A_DIRECTORY = "sandbox.not_a_directory"
     UNREADABLE = "sandbox.unreadable"
     WRITE_FORBIDDEN = "sandbox.write_forbidden"
+    WRITE_THROUGH_LINK = "sandbox.write_through_link"
+    BAD_PATH = "sandbox.bad_path"
     FILE_BYTE_CAP = "sandbox.file_byte_cap"
     RUN_BYTE_CAP = "sandbox.run_byte_cap"
     FILE_COUNT_CAP = "sandbox.file_count_cap"
@@ -87,6 +89,13 @@ _SPEC: Mapping[ErrorCode, _Spec] = MappingProxyType(
         ErrorCode.WRITE_FORBIDDEN: _Spec(
             ErrorCategory.PERMISSION,
             "this sandbox has no write root: writes go through the scaffold factory",
+        ),
+        ErrorCode.WRITE_THROUGH_LINK: _Spec(
+            ErrorCategory.PERMISSION,
+            "the destination is a symbolic link: a write is never followed through one",
+        ),
+        ErrorCode.BAD_PATH: _Spec(
+            ErrorCategory.VALIDATION, "the path cannot be resolved on this filesystem"
         ),
         ErrorCode.FILE_BYTE_CAP: _Spec(
             ErrorCategory.BUSINESS,

@@ -6,6 +6,8 @@ escape fixtures are built here at test time rather than committed: a symlink to 
 not something to put in a public repository.
 """
 
+import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -442,3 +444,208 @@ def test_several_roots_are_each_allowed(tmp_path: Path) -> None:
     assert box.read_text(first / "README.md") == "# oms\n"
     assert box.read_text(second / "README.md") == "# oms\n"
     assert box.usage.files_read == 2
+
+
+# -- what a review found: escapes the rule-by-rule tests above did not reach ------------------
+
+
+def test_a_write_is_not_followed_through_a_symlinked_destination(tmp_path: Path) -> None:
+    # `kit new` writes into a target checkout that is untrusted content, so the destination name
+    # itself can be a planted link. Resolving only the parent left the final component raw, and an
+    # open follows a link like any other: the write landed on whatever it pointed at.
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    target.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("untouched\n")
+    (target / "CLAUDE.md").symlink_to(outside)
+    box = Sandbox(Principal.lead("lead"), [root], write_root=target)
+    with pytest.raises(KitError) as caught:
+        box.write_text("CLAUDE.md", "planted\n")
+    assert caught.value.code is ErrorCode.WRITE_THROUGH_LINK
+    assert caught.value.category.value == "permission"
+    assert outside.read_text() == "untouched\n"
+
+
+def test_a_write_cannot_reach_a_denied_file_through_a_link(tmp_path: Path) -> None:
+    # The same escape aimed inside the write root: the deny list would be bypassed on the write
+    # path, because the name asked for carries no denied segment.
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / ".env").write_text("TOKEN=shh\n")
+    (target / "notes.md").symlink_to(target / ".env")
+    box = Sandbox(Principal.lead("lead"), [root], write_root=target)
+    with pytest.raises(KitError) as caught:
+        box.write_text("notes.md", "planted\n")
+    assert caught.value.code is ErrorCode.WRITE_THROUGH_LINK
+    assert (target / ".env").read_text() == "TOKEN=shh\n"
+
+
+def test_a_write_cannot_reach_outside_through_a_link_in_a_subdirectory(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    (target / "docs").mkdir(parents=True)
+    outside = tmp_path / "outside.md"
+    outside.write_text("untouched\n")
+    (target / "docs" / "CLAUDE.md").symlink_to(outside)
+    box = Sandbox(Principal.lead("lead"), [root], write_root=target)
+    with pytest.raises(KitError) as caught:
+        box.write_text("docs/CLAUDE.md", "planted\n")
+    assert caught.value.code is ErrorCode.WRITE_THROUGH_LINK
+    assert outside.read_text() == "untouched\n"
+
+
+def test_a_write_over_a_directory_is_refused(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    (target / "docs").mkdir(parents=True)
+    box = Sandbox(Principal.lead("lead"), [root], write_root=target)
+    for destination in ("docs", "docs/.."):
+        with pytest.raises(KitError) as caught:
+            box.write_text(destination, "x\n")
+        assert caught.value.code in {ErrorCode.NOT_A_FILE, ErrorCode.OUTSIDE_ROOT}
+    assert (target / "docs").is_dir()
+
+
+def _understate_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make `fstat` report one byte, as a file that grows after the check would.
+
+    Patched on the `os` module itself, which is the object the sandbox calls through.
+    """
+    real_fstat = os.fstat
+
+    def small(fd: int) -> os.stat_result:
+        status = real_fstat(fd)
+        return os.stat_result(
+            (
+                status.st_mode,
+                status.st_ino,
+                status.st_dev,
+                status.st_nlink,
+                status.st_uid,
+                status.st_gid,
+                1,
+                int(status.st_atime),
+                int(status.st_mtime),
+                int(status.st_ctime),
+            )
+        )
+
+    monkeypatch.setattr(os, "fstat", small)
+
+
+def test_the_per_file_cap_bounds_the_read_not_just_the_reported_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The size came from a separate call, so it was a claim about the past: a file that grew in
+    # between was served whole and `usage` recorded the old number.
+    root = _tree(tmp_path / "repo")
+    (root / "grows.txt").write_text("x" * 100)
+    box = _sandbox(root, SandboxLimits(max_file_bytes=4))
+    _understate_size(monkeypatch)
+    with pytest.raises(KitError) as caught:
+        box.read_bytes(root / "grows.txt")
+    assert caught.value.code is ErrorCode.FILE_BYTE_CAP
+    assert box.usage == Usage(files_read=0, bytes_read=0)
+
+
+def test_the_run_cap_bounds_the_read_too(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _tree(tmp_path / "repo")
+    (root / "grows.txt").write_text("x" * 100)
+    box = _sandbox(root, SandboxLimits(max_run_bytes=4))
+    _understate_size(monkeypatch)
+    with pytest.raises(KitError) as caught:
+        box.read_bytes(root / "grows.txt")
+    assert caught.value.code is ErrorCode.RUN_BYTE_CAP
+    assert box.usage.bytes_read == 0
+
+
+def test_usage_records_what_was_served(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    box = _sandbox(root)
+    served = box.read_bytes(root / "src" / "Main.java")
+    assert box.usage == Usage(files_read=1, bytes_read=len(served))
+
+
+def test_a_file_that_is_not_a_regular_file_is_refused(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    os.mkfifo(root / "pipe")
+    with pytest.raises(KitError) as caught:
+        _sandbox(root).read_bytes(root / "pipe")
+    # Refused before the open, so reading a pipe cannot hang the run either.
+    assert caught.value.code is ErrorCode.NOT_A_FILE
+
+
+def _refuse_iterdir(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    """Make one directory unreadable, the way a mode-000 directory is for a non-root user."""
+    real_iterdir = Path.iterdir
+
+    def iterdir(self: Path) -> Iterator[Path]:
+        if self.name == name:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+
+
+def test_an_unreadable_directory_is_a_refusal_not_an_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A bare OSError would leave the Proxy carrying the absolute path it was given, which is the
+    # one thing no message here may do.
+    root = _tree(tmp_path / "repo")
+    (root / "locked").mkdir()
+    box = _sandbox(root)
+    _refuse_iterdir(monkeypatch, "locked")
+    with pytest.raises(KitError) as caught:
+        box.list_dir(root / "locked")
+    assert caught.value.code is ErrorCode.UNREADABLE
+    assert str(root) not in caught.value.message
+    assert box.refusals[-1].code is ErrorCode.UNREADABLE
+
+
+def test_walk_carries_on_past_an_unreadable_directory_and_records_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Otherwise an unreadable directory ends the walk, and 19.8's brief gets a crash where it
+    # should get named unexplored ground.
+    root = _tree(tmp_path / "repo")
+    (root / "locked").mkdir()
+    (root / "locked" / "hidden.java").write_text("class Hidden {}\n")
+    box = _sandbox(root)
+    _refuse_iterdir(monkeypatch, "locked")
+    found = [path.relative_to(root).as_posix() for path in box.walk(root)]
+    assert found == ["README.md", "src/Main.java"]
+    assert ErrorCode.UNREADABLE in {refusal.code for refusal in box.refusals}
+
+
+def test_a_path_that_cannot_be_resolved_is_a_refusal(tmp_path: Path) -> None:
+    box = _sandbox(_tree(tmp_path / "repo"))
+    with pytest.raises(KitError) as caught:
+        box.read_text("has\0nul")
+    assert caught.value.code is ErrorCode.BAD_PATH
+    assert caught.value.category.value == "validation"
+
+
+def test_two_links_to_one_file_are_one_entry(tmp_path: Path) -> None:
+    # `coverage.files_total` is counted from these, so duplicates would overcount.
+    root = _tree(tmp_path / "repo")
+    (root / "a.java").symlink_to(root / "src" / "Main.java")
+    (root / "b.java").symlink_to(root / "src" / "Main.java")
+    box = _sandbox(root)
+    listed = box.list_dir(root)
+    assert len(listed) == len(set(listed))
+    walked = box.walk(root)
+    assert walked == tuple(sorted({root / "README.md", (root / "src" / "Main.java")}))
+
+
+def test_a_hard_link_to_a_denied_file_is_served_and_that_is_known(tmp_path: Path) -> None:
+    # Named rather than implied: the rules resolve symlinks and match the deny list against the
+    # segments of the resolved path, and a hard link has no second path to match. Closing it would
+    # mean refusing any file with st_nlink > 1, which the spec does not ask for -- so this test
+    # pins the limitation so a later slice changes it deliberately rather than by accident.
+    root = _tree(tmp_path / "repo")
+    (root / ".env").write_text("TOKEN=shh\n")
+    os.link(root / ".env", root / "notes.txt")
+    assert _sandbox(root).read_text(root / "notes.txt") == "TOKEN=shh\n"

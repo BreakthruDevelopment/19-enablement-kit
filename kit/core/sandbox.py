@@ -29,12 +29,32 @@ factory, only under the write root, and the deny list and the per-file cap apply
 Every refusal is both raised as a `KitError` and recorded in `refusals`, because the migration
 brief must report refused ground in `coverage.unread_reason` rather than quietly look complete. A
 refusal records the code and the cap or pattern involved -- not the path, which the caller already
-has and which `kit.core.errors` explains it must not take from here.
+has and which `kit.core.errors` explains it must not take from here. Nothing escapes as a bare
+`OSError` either: an unreadable directory inside a root is a recorded refusal and `walk` carries
+on past it, so a permission problem cannot turn a brief into a crash -- or put an absolute path
+into an exception message.
+
+A read opens the file once and works from that descriptor: `O_NOFOLLOW` on the resolved path (whose
+final component is by definition not a link), `fstat` for the kind and the size, and a bounded read
+of the caps plus one byte. That is what makes a cap a cap -- `st_size` from a separate `stat` call
+is a claim about the past, and a file that grew in between would otherwise be served whole.
+
+**Two limitations are deliberate, and named rather than implied.** A **hard link** to a denied file
+is served: the rules the spec sets out resolve symlinks and match the deny list against the segments
+of the resolved path, and a hard link has no second path to match, so `notes.txt` hard-linked to
+`<root>/.env` reads as itself. Closing it would mean refusing any file with `st_nlink > 1`, which is
+a rule the spec does not state, so the limitation is recorded here and in the run log instead of
+being closed on a builder's own authority; 19.8 owns the brief's "no secret-shaped string" test and
+is where a content-level check belongs. Second, the **resolve-then-open** window is narrowed, not
+removed: the path is resolved by name and then opened by name, so a component *above* the file can
+be swapped in between. `O_NOFOLLOW` and the `fstat` close that window for the final component, which
+is the one an untrusted checkout can plant.
 """
 
 from __future__ import annotations
 
 import os
+import stat as stat_module
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
@@ -154,14 +174,50 @@ class Sandbox:
     # -- reads ------------------------------------------------------------------------------
 
     def read_bytes(self, path: Path | str) -> bytes:
-        """The whole file, or a `KitError`. Never a partial read."""
+        """The whole file, or a `KitError`. Never a partial read, never past a cap."""
         real = self._check_read(path)
-        size = real.stat().st_size
-        self._charge(real, size)
+        limits = self._limits
         try:
-            return real.read_bytes()
+            descriptor = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         except OSError as err:
             self._refuse(ErrorCode.UNREADABLE, cause=err, encoding="bytes")
+        try:
+            try:
+                status = os.fstat(descriptor)
+            except OSError as err:
+                self._refuse(ErrorCode.UNREADABLE, cause=err, encoding="bytes")
+            # Checked on the descriptor, not by name: this is the file that will be read, whatever
+            # the name pointed at a moment ago.
+            if not stat_module.S_ISREG(status.st_mode):
+                self._refuse(ErrorCode.NOT_A_FILE)
+            self._check_caps(real, status.st_size)
+            # The caps plus one byte: anything over the allowance proves the file grew after the
+            # `fstat`, and a cap that is refused is the specified behaviour, not a short read.
+            allowance = min(limits.max_file_bytes, limits.max_run_bytes - self._bytes)
+            try:
+                data = _read_up_to(descriptor, allowance + 1)
+            except OSError as err:
+                self._refuse(ErrorCode.UNREADABLE, cause=err, encoding="bytes")
+        finally:
+            os.close(descriptor)
+        served = len(data)
+        if served > limits.max_file_bytes:
+            self._refuse(
+                ErrorCode.FILE_BYTE_CAP,
+                cap="max_file_bytes",
+                limit=limits.max_file_bytes,
+                size=served,
+            )
+        if self._bytes + served > limits.max_run_bytes:
+            self._refuse(
+                ErrorCode.RUN_BYTE_CAP,
+                cap="max_run_bytes",
+                limit=limits.max_run_bytes,
+                spent=self._bytes,
+                size=served,
+            )
+        self._charge(real, served)
+        return data
 
     def read_text(self, path: Path | str, *, encoding: str = "utf-8") -> str:
         """The whole file decoded strictly. A decode failure refuses rather than mangles."""
@@ -180,13 +236,21 @@ class Sandbox:
         real = self._check_path(path)
         if not real.is_dir():
             self._refuse(ErrorCode.NOT_A_DIRECTORY)
-        kept: list[Path] = []
-        for child in sorted(real.iterdir()):
+        try:
+            children = sorted(real.iterdir())
+        except OSError as err:
+            # An unreadable directory is a refusal on the record, not an exception carrying its
+            # path: `coverage.unread_reason` is where a caller must be able to report it.
+            self._refuse(ErrorCode.UNREADABLE, cause=err, encoding="directory")
+        kept: set[Path] = set()
+        for child in children:
             try:
-                kept.append(self._check_path(child))
+                kept.add(self._check_path(child))
             except KitError:
                 continue
-        return tuple(kept)
+        # Deduplicated: two links to one file are one entry, or a caller counting
+        # `coverage.files_total` from a listing would overcount.
+        return tuple(sorted(kept))
 
     def walk(self, path: Path | str) -> tuple[Path, ...]:
         """Every readable regular file under a directory, sorted, denied subtrees pruned.
@@ -197,18 +261,24 @@ class Sandbox:
         start = self._check_path(path)
         if not start.is_dir():
             self._refuse(ErrorCode.NOT_A_DIRECTORY)
-        found: list[Path] = []
+        found: set[Path] = set()
         stack = [start]
         seen: set[Path] = {start}
         while stack:
             current = stack.pop()
-            for child in self.list_dir(current):
+            try:
+                children = self.list_dir(current)
+            except KitError:
+                # Recorded by `list_dir`. A directory nobody may read must not end the walk: the
+                # brief names unexplored ground, so the rest of the tree still has to be counted.
+                continue
+            for child in children:
                 if child.is_dir():
                     if child not in seen:
                         seen.add(child)
                         stack.append(child)
                 elif child.is_file():
-                    found.append(child)
+                    found.add(child)
         return tuple(sorted(found))
 
     # -- the one write path -----------------------------------------------------------------
@@ -224,28 +294,61 @@ class Sandbox:
         if write_root is None:
             self._refuse(ErrorCode.WRITE_FORBIDDEN)
         target = Path(path)
-        # The file may not exist yet, so the parent is what gets resolved; the name is then joined
-        # on so a symlinked parent cannot smuggle the write out of the root.
-        real_parent = _real(target.parent if target.is_absolute() else write_root / target.parent)
-        real = real_parent / target.name
+        # The file may not exist yet, so the parent is resolved first and the name joined on. The
+        # joined path is then resolved in turn and BOTH rules are applied to the result: a
+        # destination that is itself a link would otherwise be written straight through, out of the
+        # root or over a denied file, because an open follows a link like any other.
+        parent = target.parent if target.is_absolute() else write_root / target.parent
+        real_parent = self._real(parent)
+        candidate = real_parent / target.name
+        if candidate.is_symlink():
+            self._refuse(ErrorCode.WRITE_THROUGH_LINK)
+        real = self._real(candidate)
         if not _within(real, write_root):
             self._refuse(ErrorCode.OUTSIDE_ROOT)
         denied = _denied_pattern(real.relative_to(write_root).parts)
         if denied is not None:
             self._refuse(ErrorCode.DENIED_NAME, pattern=denied)
+        if real.exists() and not real.is_file():
+            self._refuse(ErrorCode.NOT_A_FILE)
         data = content.encode(encoding)
         limit = self._limits.max_file_bytes
         if len(data) > limit:
             self._refuse(ErrorCode.FILE_BYTE_CAP, cap="max_file_bytes", limit=limit, size=len(data))
-        real_parent.mkdir(parents=True, exist_ok=True)
-        real.write_bytes(data)
+        try:
+            real.parent.mkdir(parents=True, exist_ok=True)
+            # `O_NOFOLLOW` as well: the link check above is by name, and this is the open itself.
+            descriptor = os.open(
+                real,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o644,
+            )
+        except OSError as err:
+            self._refuse(ErrorCode.UNREADABLE, cause=err, encoding="bytes")
+        try:
+            os.write(descriptor, data)
+        except OSError as err:
+            self._refuse(ErrorCode.UNREADABLE, cause=err, encoding="bytes")
+        finally:
+            os.close(descriptor)
         return real
 
     # -- checks -----------------------------------------------------------------------------
 
+    def _real(self, path: Path | str) -> Path:
+        """`_real`, with a failure turned into a recorded refusal rather than an exception.
+
+        A path carrying a NUL byte raises `ValueError` from the C layer, and `realpath` can raise
+        `OSError`; either would otherwise leave the Proxy carrying the path it was given.
+        """
+        try:
+            return _real(path)
+        except (OSError, ValueError) as err:
+            self._refuse(ErrorCode.BAD_PATH, cause=err)
+
     def _check_path(self, path: Path | str) -> Path:
         """Resolve, then the allowlist, then the deny list. Shared by reads and listings."""
-        real = _real(path)
+        real = self._real(path)
         root = self._containing_root(real)
         if root is None:
             self._refuse(ErrorCode.OUTSIDE_ROOT)
@@ -268,7 +371,7 @@ class Sandbox:
                 return root
         return None
 
-    def _charge(self, real: Path, size: int) -> None:
+    def _check_caps(self, real: Path, size: int) -> None:
         """Apply the three caps before a byte is read. Refuses rather than truncates."""
         limits = self._limits
         if size > limits.max_file_bytes:
@@ -289,8 +392,11 @@ class Sandbox:
                 spent=self._bytes,
                 size=size,
             )
+
+    def _charge(self, real: Path, served: int) -> None:
+        """Record what was actually served, once the read has happened."""
         self._files.add(real)
-        self._bytes += size
+        self._bytes += served
 
     def _refuse(
         self, code: ErrorCode, *, cause: BaseException | None = None, **detail: int | str
@@ -299,6 +405,19 @@ class Sandbox:
         err = KitError(code, **detail)
         self._refusals.append(Refusal.of(err))
         raise err from cause
+
+
+def _read_up_to(descriptor: int, limit: int) -> bytes:
+    """At most `limit` bytes from an open descriptor, looping because `read` may return less."""
+    chunks: list[bytes] = []
+    remaining = limit
+    while remaining > 0:
+        chunk = os.read(descriptor, min(remaining, 1 << 20))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def _within(candidate: Path, root: Path) -> bool:
