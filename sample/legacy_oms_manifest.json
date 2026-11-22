@@ -1,0 +1,151 @@
+{
+  "app_name": "Harbor OMS",
+  "java_package": "com.harbor.oms",
+  "datasource_jndi": "java:comp/env/jdbc/OrderDS",
+  "datasource_global_jndi": "jdbc/HarborOrderDS",
+  "ear": "harbor-oms.ear",
+  "ejb_jar": "harbor-oms-ejb.jar",
+  "web_war": "harbor-oms-web.war",
+  "context_root": "oms",
+  "planted": {
+    "jndi_class_count": 9,
+    "self_managed_transaction_ejb": "PricingService",
+    "self_managed_transaction_method": "applyPriceOverride",
+    "sql_concatenation_dao": "OrderDao",
+    "sql_concatenation_method": "findByCustomerAndStatus",
+    "http_database_ejb": "CatalogAdmin"
+  },
+  "entities": [
+    {
+      "name": "Customer",
+      "subpackage": "customer",
+      "table": "customer",
+      "dao": "CustomerDao",
+      "description": "A buyer the order desk can sell to. Credit and hold status live on this row.",
+      "business_methods": ["placeOnHold", "releaseHold"],
+      "fields": [
+        {"name": "customerId", "column": "customer_id", "java_type": "String", "sql_type": "VARCHAR(32)"},
+        {"name": "legalName", "column": "legal_name", "java_type": "String", "sql_type": "VARCHAR(120)"},
+        {"name": "regionCode", "column": "region_code", "java_type": "String", "sql_type": "VARCHAR(8)"},
+        {"name": "creditLimitCents", "column": "credit_limit_cents", "java_type": "long", "sql_type": "BIGINT"},
+        {"name": "statusCode", "column": "status_code", "java_type": "String", "sql_type": "VARCHAR(16)"},
+        {"name": "buyerName", "column": "buyer_name", "java_type": "String", "sql_type": "VARCHAR(80)"},
+        {"name": "city", "column": "city", "java_type": "String", "sql_type": "VARCHAR(80)"},
+        {"name": "openedOn", "column": "opened_on", "java_type": "String", "sql_type": "VARCHAR(10)"}
+      ]
+    },
+    {
+      "name": "Product",
+      "subpackage": "product",
+      "table": "product",
+      "dao": "ProductDao",
+      "description": "A sku stocked in one warehouse. The desk reserves quantity off on_hand.",
+      "business_methods": ["reserve", "release"],
+      "fields": [
+        {"name": "sku", "column": "sku", "java_type": "String", "sql_type": "VARCHAR(32)"},
+        {"name": "description", "column": "description", "java_type": "String", "sql_type": "VARCHAR(200)"},
+        {"name": "unitPriceCents", "column": "unit_price_cents", "java_type": "long", "sql_type": "BIGINT"},
+        {"name": "onHand", "column": "on_hand", "java_type": "int", "sql_type": "INTEGER"},
+        {"name": "warehouseCode", "column": "warehouse_code", "java_type": "String", "sql_type": "VARCHAR(16)"},
+        {"name": "reorderPoint", "column": "reorder_point", "java_type": "int", "sql_type": "INTEGER"},
+        {"name": "activeFlag", "column": "active_flag", "java_type": "String", "sql_type": "VARCHAR(1)"},
+        {"name": "vendorCode", "column": "vendor_code", "java_type": "String", "sql_type": "VARCHAR(32)"}
+      ]
+    },
+    {
+      "name": "SalesOrder",
+      "subpackage": "order",
+      "table": "sales_order",
+      "dao": "OrderDao",
+      "description": "One desk order for one sku. The line row is written with the order.",
+      "business_methods": ["cancel", "attachBuyerPo"],
+      "fields": [
+        {"name": "orderId", "column": "order_id", "java_type": "String", "sql_type": "VARCHAR(32)"},
+        {"name": "customerId", "column": "customer_id", "java_type": "String", "sql_type": "VARCHAR(32)"},
+        {"name": "statusCode", "column": "status_code", "java_type": "String", "sql_type": "VARCHAR(16)"},
+        {"name": "placedOn", "column": "placed_on", "java_type": "String", "sql_type": "VARCHAR(10)"},
+        {"name": "requestedShip", "column": "requested_ship", "java_type": "String", "sql_type": "VARCHAR(10)"},
+        {"name": "totalCents", "column": "total_cents", "java_type": "long", "sql_type": "BIGINT"},
+        {"name": "currencyCode", "column": "currency_code", "java_type": "String", "sql_type": "VARCHAR(3)"},
+        {"name": "buyerPo", "column": "buyer_po", "java_type": "String", "sql_type": "VARCHAR(40)"},
+        {"name": "warehouseCode", "column": "warehouse_code", "java_type": "String", "sql_type": "VARCHAR(16)"},
+        {"name": "lineSku", "column": "line_sku", "java_type": "String", "sql_type": "VARCHAR(32)"},
+        {"name": "lineQuantity", "column": "line_quantity", "java_type": "int", "sql_type": "INTEGER"}
+      ]
+    },
+    {
+      "name": "Shipment",
+      "subpackage": "shipment",
+      "table": "shipment",
+      "dao": "ShipmentDao",
+      "description": "A dock shipment against one order, from staged through delivered.",
+      "business_methods": ["markShipped", "markDelivered"],
+      "fields": [
+        {"name": "shipmentId", "column": "shipment_id", "java_type": "String", "sql_type": "VARCHAR(32)"},
+        {"name": "orderId", "column": "order_id", "java_type": "String", "sql_type": "VARCHAR(32)"},
+        {"name": "carrier", "column": "carrier", "java_type": "String", "sql_type": "VARCHAR(40)"},
+        {"name": "trackingNo", "column": "tracking_no", "java_type": "String", "sql_type": "VARCHAR(40)"},
+        {"name": "shippedOn", "column": "shipped_on", "java_type": "String", "sql_type": "VARCHAR(10)"},
+        {"name": "statusCode", "column": "status_code", "java_type": "String", "sql_type": "VARCHAR(16)"},
+        {"name": "weightGrams", "column": "weight_grams", "java_type": "int", "sql_type": "INTEGER"},
+        {"name": "dockDoor", "column": "dock_door", "java_type": "String", "sql_type": "VARCHAR(16)"}
+      ]
+    }
+  ],
+  "sessions": [
+    {
+      "name": "OrderService",
+      "subpackage": "order",
+      "description": "Places, cancels and looks up desk orders for an active buyer.",
+      "pool": 30,
+      "entity_refs": ["Customer", "Product", "SalesOrder"],
+      "methods": ["placeOrder", "cancelOrder", "findOrdersForCustomer", "attachBuyerPo"]
+    },
+    {
+      "name": "InventoryService",
+      "subpackage": "inventory",
+      "description": "On-hand quantity, reservations and the reorder list for one warehouse.",
+      "pool": 20,
+      "entity_refs": ["Product"],
+      "methods": ["onHand", "reserveStock", "releaseStock", "belowReorder"]
+    },
+    {
+      "name": "PricingService",
+      "subpackage": "pricing",
+      "description": "Region quotes from the product book, and buyer-approved price overrides.",
+      "pool": 15,
+      "entity_refs": ["Product"],
+      "methods": ["quote", "applyPriceOverride", "priceBookForRegion"]
+    },
+    {
+      "name": "FulfillmentService",
+      "subpackage": "fulfillment",
+      "description": "Stages a shipment, marks it shipped and records delivery at the dock.",
+      "pool": 20,
+      "entity_refs": ["SalesOrder", "Shipment"],
+      "methods": ["createShipment", "markShipped", "markDelivered", "findShipments"]
+    },
+    {
+      "name": "CatalogAdmin",
+      "subpackage": "catalog",
+      "description": "Adds skus, retires them and moves a sku between warehouses.",
+      "pool": 10,
+      "entity_refs": ["Product"],
+      "methods": ["addProduct", "discontinueProduct", "updateWarehouse"]
+    }
+  ],
+  "servlets": [
+    {
+      "name": "OrderEntryServlet",
+      "url": "/orders/new",
+      "ejb_ref": "OrderService",
+      "description": "The desk form that places one order."
+    },
+    {
+      "name": "OrderStatusServlet",
+      "url": "/orders/status",
+      "ejb_ref": "OrderService",
+      "description": "Looks up orders for a buyer and a status."
+    }
+  ]
+}

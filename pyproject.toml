@@ -39,7 +39,7 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "S", "ASYNC"]
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["kit", "tests"]
+files = ["kit", "tests", "sample/generate_legacy_oms.py"]
 warn_unreachable = true
 
 [tool.pytest.ini_options]
