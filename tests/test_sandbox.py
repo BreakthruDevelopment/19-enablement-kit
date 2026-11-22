@@ -7,6 +7,7 @@ not something to put in a public repository.
 """
 
 import os
+import traceback
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -910,3 +911,93 @@ def test_an_empty_root_is_not_the_working_directory(tmp_path: Path) -> None:
         with pytest.raises(KitError) as caught:
             Sandbox(Principal.engineer("dev"), roots)
         assert caught.value.code is ErrorCode.BAD_ROOT
+
+
+# -- fourth review ----------------------------------------------------------------------------
+
+
+def test_walk_stays_under_the_directory_it_was_asked_about(tmp_path: Path) -> None:
+    # A link to somewhere else inside the roots is readable, but it is not a file *under* this
+    # directory, and `coverage.files_total` is counted from here.
+    root = _tree(tmp_path / "repo")
+    (root / "src" / "up").symlink_to(root, target_is_directory=True)
+    found = _sandbox(root).walk(root / "src")
+    assert [path.relative_to(root).as_posix() for path in found] == ["src/Main.java"]
+
+
+def test_a_failed_write_leaves_the_destination_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Written through a temporary file and renamed, so a failure cannot leave a truncated file
+    # that 19.4's manifest then lists as written.
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "CLAUDE.md").write_text("# the previous version\n")
+    box = Sandbox(Principal.lead("lead"), [root], write_root=target)
+
+    def no_space(fd: int, data: bytes) -> int:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "write", no_space)
+    with pytest.raises(KitError) as caught:
+        box.write_text("CLAUDE.md", "# the new version, interrupted\n")
+    monkeypatch.undo()
+    assert caught.value.code is ErrorCode.WRITE_FAILED
+    assert (target / "CLAUDE.md").read_text() == "# the previous version\n"
+    # And no litter left behind.
+    assert [path.name for path in target.iterdir()] == ["CLAUDE.md"]
+
+
+def test_a_refused_write_capability_is_on_the_record(tmp_path: Path) -> None:
+    root = _tree(tmp_path / "repo")
+    target = tmp_path / "target"
+    target.mkdir()
+    box = Sandbox(Principal.ci(), [root], write_root=target)
+    with pytest.raises(KitError):
+        box.write_text("CLAUDE.md", "x\n")
+    # A caller reading `refusals` should not have to know which came from the capability check.
+    assert [refusal.code for refusal in box.refusals] == [ErrorCode.FORBIDDEN]
+
+
+def test_a_root_that_is_itself_a_denied_name_is_refused(tmp_path: Path) -> None:
+    # The deny list is matched relative to a root, so `roots=[<repo>/.git]` would have no `.git`
+    # segment left to match and would serve everything inside it.
+    root = _tree(tmp_path / "repo")
+    for name in (".git", "secrets", ".claude"):
+        (root / name).mkdir()
+        with pytest.raises(KitError) as caught:
+            Sandbox(Principal.engineer("dev"), [root / name])
+        assert caught.value.code is ErrorCode.BAD_ROOT
+
+
+def test_an_open_failure_is_a_read_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _tree(tmp_path / "repo")
+    box = _sandbox(root)
+    real_open = os.open
+
+    def refused(path: object, flags: int, mode: int = 0o777) -> int:
+        raise OSError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(os, "open", refused)
+    with pytest.raises(KitError) as caught:
+        box.read_bytes(root / "README.md")
+    monkeypatch.undo()
+    assert real_open is os.open
+    assert caught.value.code is ErrorCode.READ_FAILED
+    assert caught.value.category.value == "internal"
+    assert str(root) not in caught.value.message
+
+
+def test_a_refusal_does_not_chain_an_exception_carrying_the_path(tmp_path: Path) -> None:
+    # An OSError keeps the path in `filename` and in its own message, so a chained cause would
+    # put the path back into any traceback a later slice logs. `raise ... from None` leaves no
+    # `__cause__` and sets `__suppress_context__`, which is what keeps the context out of a
+    # printed traceback.
+    root = _tree(tmp_path / "repo")
+    box = _sandbox(root)
+    with pytest.raises(KitError) as caught:
+        box.read_text(root / _TOO_LONG)
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__ is True
+    assert str(root) not in "".join(traceback.format_exception_only(caught.value))

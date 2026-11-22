@@ -60,6 +60,7 @@ import contextlib
 import errno
 import os
 import stat as stat_module
+import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
@@ -161,6 +162,12 @@ class Sandbox:
         status = self._status(real)
         if status is None or not stat_module.S_ISDIR(status.st_mode):
             raise KitError(ErrorCode.BAD_ROOT)
+        # The deny list is matched relative to a root, so a root that is *itself* a denied name
+        # would serve everything inside it: `roots=[<repo>/.git]` has no `.git` segment left to
+        # match. A checkout that merely lives under such a directory is fine, because only the
+        # root's own last segment is tested here.
+        if _denied_pattern([real.name]) is not None:
+            raise KitError(ErrorCode.BAD_ROOT)
         return real
 
     # -- what the run has spent, and what it was refused ------------------------------------
@@ -196,7 +203,10 @@ class Sandbox:
             # could refuse it, and a CLI run has no timeout. It costs a regular file nothing.
             descriptor = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
         except OSError as err:
-            self._refuse(ErrorCode.UNREADABLE, cause=err, encoding="bytes")
+            # The same class of problem as a failed read, and reported the same way: an EACCES
+            # here read as `validation` ("could not be read as bytes text") while the identical
+            # errno on its directory read as `internal`.
+            self._refuse(ErrorCode.READ_FAILED, cause=err)
         try:
             try:
                 status = os.fstat(descriptor)
@@ -302,6 +312,10 @@ class Sandbox:
                 # brief names unexplored ground, so the rest of the tree still has to be counted.
                 continue
             for child in children:
+                if not _within(child, start):
+                    # A link to somewhere else inside the roots is readable, but it is not a file
+                    # *under* this directory, and 19.8 counts `coverage.files_total` from here.
+                    continue
                 try:
                     child_status = self._status(child)
                 except KitError:
@@ -326,7 +340,13 @@ class Sandbox:
         `engineer` and `ci` are refused by `assert_can` before anything is resolved: they hold no
         `write_target` capability at all.
         """
-        assert_can(self._principal, Capability.WRITE_TARGET)
+        try:
+            assert_can(self._principal, Capability.WRITE_TARGET)
+        except KitError as err:
+            # Recorded like every other refusal: a caller reading `refusals` should not have to
+            # know which of them came from the capability check.
+            self._refusals.append(Refusal.of(err))
+            raise
         write_root = self._write_root
         if write_root is None:
             self._refuse(ErrorCode.WRITE_FORBIDDEN)
@@ -362,27 +382,30 @@ class Sandbox:
         parent_status = self._status(real.parent)
         if parent_status is not None and not stat_module.S_ISDIR(parent_status.st_mode):
             self._refuse(ErrorCode.NOT_A_DIRECTORY)
+        # Written to a temporary file beside the destination and renamed over it, so a failure
+        # leaves the destination as it was rather than a truncated file that a manifest then
+        # lists as written. The rename replaces a link rather than following one, which is also
+        # the safer answer if one appeared since the check above.
         try:
             real.parent.mkdir(parents=True, exist_ok=True)
-            # `O_NOFOLLOW` as well: the link check above is by name, and this is the open itself.
-            descriptor = os.open(
-                real,
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
-                0o644,
-            )
-        except OSError as err:
+            descriptor, temporary = tempfile.mkstemp(dir=real.parent, prefix=".kit-", suffix=".tmp")
+        except (OSError, ValueError) as err:
             self._refuse(ErrorCode.WRITE_FAILED, cause=err)
         try:
             _write_all(descriptor, data)
-        except OSError as err:
-            _close_quietly(descriptor)
-            self._refuse(ErrorCode.WRITE_FAILED, cause=err)
-        try:
-            # Not in a `finally`: a deferred `ENOSPC` or `EIO` surfaces here, after the last
-            # `write` returned, and a scaffold that reports success on a truncated file is worse
-            # than one that fails.
+            # Closed here rather than in a `finally`: a deferred `ENOSPC` or `EIO` surfaces at
+            # the close, after the last `write` returned, and a scaffold that reports success on
+            # a truncated file is worse than one that fails.
             os.close(descriptor)
         except OSError as err:
+            _close_quietly(descriptor)
+            _unlink_quietly(temporary)
+            self._refuse(ErrorCode.WRITE_FAILED, cause=err)
+        try:
+            os.chmod(temporary, 0o644)
+            os.replace(temporary, real)
+        except OSError as err:
+            _unlink_quietly(temporary)
             self._refuse(ErrorCode.WRITE_FAILED, cause=err)
         return real
 
@@ -473,7 +496,12 @@ class Sandbox:
         """Record the refusal, then raise it. No code declares a detail field named `cause`."""
         err = KitError(code, **detail)
         self._refusals.append(Refusal.of(err))
-        raise err from cause
+        if cause is None:
+            raise err
+        # `from None`, deliberately: an `OSError` keeps the path it was given in `filename` and in
+        # its own message, so chaining it would put that path back into any traceback a later
+        # slice logs -- the one thing this module promises not to do. The code says what happened.
+        raise err from None
 
 
 def _read_up_to(descriptor: int, limit: int) -> bytes:
@@ -506,3 +534,8 @@ def _write_all(descriptor: int, data: bytes) -> None:
 def _close_quietly(descriptor: int) -> None:
     with contextlib.suppress(OSError):
         os.close(descriptor)
+
+
+def _unlink_quietly(path: str) -> None:
+    with contextlib.suppress(OSError):
+        os.unlink(path)

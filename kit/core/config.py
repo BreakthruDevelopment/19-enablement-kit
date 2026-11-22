@@ -21,7 +21,8 @@ from typing import Any, Final
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from kit.core.errors import ErrorCode, KitError, safe_token
+from kit.core.errors import ErrorCode, KitError
+from kit.core.schema import first_problem, known_fields
 
 __all__ = ["Config", "GatewayConfig", "SandboxLimits"]
 
@@ -64,6 +65,12 @@ class Config(BaseModel):
     gateway: GatewayConfig = GatewayConfig()
     contract_path: Path = Path("contracts/p2p-erp.json")
 
+    # Open question for the slice that reads a config file from a checkout (19.10, the CI
+    # workflow): `sandbox` here sets the Proxy's own caps, so a `ci` run that took its config
+    # from the pull request under review would let a contributor set the limits meant to contain
+    # it. Nothing in this slice reads a file from a checkout -- `ci` is expected to run on
+    # `Config.default()` -- and the decision is reserved here rather than left implicit.
+
     @classmethod
     def default(cls) -> Config:
         return cls()
@@ -76,11 +83,16 @@ class Config(BaseModel):
         `config.invalid` if a field is wrong.
         """
         try:
-            if path.stat().st_size > _MAX_CONFIG_BYTES:
-                raise KitError(ErrorCode.CONFIG_UNREADABLE)
-            raw = path.read_bytes()
-        except OSError as err:
+            with path.open("rb") as handle:
+                # Bounded by the read itself, not by a separate `stat`: a size from an earlier
+                # call is a claim about the past, which is the shape the sandbox refuses too.
+                raw = handle.read(_MAX_CONFIG_BYTES + 1)
+        except (OSError, ValueError) as err:
+            # `ValueError` as well: a path carrying a NUL byte raises it from the C layer, and a
+            # caller was promised a `KitError`.
             raise KitError(ErrorCode.CONFIG_UNREADABLE) from err
+        if len(raw) > _MAX_CONFIG_BYTES:
+            raise KitError(ErrorCode.CONFIG_UNREADABLE)
         try:
             data = tomllib.loads(raw.decode("utf-8"))
         except (tomllib.TOMLDecodeError, UnicodeDecodeError) as err:
@@ -92,35 +104,8 @@ class Config(BaseModel):
         try:
             return cls.model_validate(data)
         except ValidationError as err:
-            field, problem = _first_problem(err, _KNOWN_FIELDS)
+            field, problem = first_problem(err, _KNOWN_FIELDS)
             raise KitError(ErrorCode.CONFIG_INVALID, field=field, problem=problem) from err
 
 
-def _known_fields(model: type[BaseModel], prefix: str = "") -> frozenset[str]:
-    """Every dotted field path the model accepts, derived from the model, not written out."""
-    paths: set[str] = set()
-    for name, info in model.model_fields.items():
-        path = f"{prefix}{name}"
-        paths.add(path)
-        annotation = info.annotation
-        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-            paths |= _known_fields(annotation, f"{path}.")
-    return frozenset(paths)
-
-
-def _first_problem(err: ValidationError, known: frozenset[str]) -> tuple[str, str]:
-    """A schema-derived field path and a fixed problem token for the first error.
-
-    The value pydantic saw is deliberately dropped, and a field path the file invented -- an
-    unknown key, which `extra="forbid"` reports under its own name -- becomes `unrecognized`.
-    """
-    first = err.errors()[0]
-    path = ".".join(str(part) for part in first["loc"])
-    field = path if path in known else "unrecognized"
-    # Pydantic's error types are fixed identifiers (`extra_forbidden`, `greater_than`), but a
-    # custom validator could introduce anything, and `KitError` refuses a detail value that is not
-    # a short token. Fall back rather than turn a config error into a crash.
-    return field, safe_token(str(first["type"]), fallback="invalid")
-
-
-_KNOWN_FIELDS: Final = _known_fields(Config)
+_KNOWN_FIELDS: Final = known_fields(Config)

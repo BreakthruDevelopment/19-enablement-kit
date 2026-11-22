@@ -20,7 +20,8 @@ from typing import Literal
 from agent_container.core.tool import ErrorCategory
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from kit.core.errors import ErrorCode, KitError, safe_token
+from kit.core.errors import ErrorCode, KitError
+from kit.core.schema import first_problem, known_fields
 
 __all__ = ["ContractTool", "ErrorShape", "GatewayContract", "ServerInfo", "load_contract"]
 
@@ -114,11 +115,12 @@ def load_contract(path: Path) -> GatewayContract:
     `contract.invalid` if it does not match the schema. Neither message quotes the file.
     """
     try:
-        if path.stat().st_size > _MAX_CONTRACT_BYTES:
-            raise KitError(ErrorCode.CONTRACT_UNREADABLE)
-        raw = path.read_bytes()
-    except OSError as err:
+        with path.open("rb") as handle:
+            raw = handle.read(_MAX_CONTRACT_BYTES + 1)
+    except (OSError, ValueError) as err:
         raise KitError(ErrorCode.CONTRACT_UNREADABLE) from err
+    if len(raw) > _MAX_CONTRACT_BYTES:
+        raise KitError(ErrorCode.CONTRACT_UNREADABLE)
     try:
         data = json.loads(raw.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as err:
@@ -126,10 +128,13 @@ def load_contract(path: Path) -> GatewayContract:
     try:
         return GatewayContract.model_validate(data)
     except ValidationError as err:
-        first = err.errors()[0]
-        location = ".".join(str(part) for part in first["loc"])
-        raise KitError(
-            ErrorCode.CONTRACT_INVALID,
-            field=safe_token(location, fallback="unrecognized"),
-            problem=safe_token(str(first["type"]), fallback="invalid"),
-        ) from err
+        # Through `known_fields`, not `safe_token` alone: the contract path is configurable and
+        # the file sits in a checkout, so an invented key is well-shaped input, not a safe name.
+        field, problem = first_problem(err, _KNOWN_FIELDS)
+        raise KitError(ErrorCode.CONTRACT_INVALID, field=field, problem=problem) from err
+
+
+_KNOWN_FIELDS = known_fields(GatewayContract) | frozenset(
+    # `tools` and `errors` hold models in a sequence, which `known_fields` does not walk into.
+    known_fields(ContractTool, "tools.") | known_fields(ErrorShape, "errors.")
+)
