@@ -1,0 +1,13 @@
+{
+  "description": "Recorded tests-coverage pass over the demo diff.",
+  "replies": [
+    {
+      "stop_reason": "end_turn",
+      "text": "{\n \"findings\": [],\n \"passes_run\": [\n  \"tests-coverage\"\n ]\n}",
+      "usage": {
+        "input_tokens": 4600,
+        "output_tokens": 12
+      }
+    }
+  ]
+}

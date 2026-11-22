@@ -1,0 +1,13 @@
+{
+  "description": "Recorded correctness pass over the demo diff.",
+  "replies": [
+    {
+      "stop_reason": "end_turn",
+      "text": "{\n \"findings\": [\n  {\n   \"path\": \"src/main/java/com/harbor/oms/search/OrderSearchService.java\",\n   \"line\": 49,\n   \"category\": \"correctness\",\n   \"claim\": \"Status is compared with == against a string literal, so a status read from the database is never equal to it and cancelled orders are never hidden.\",\n   \"evidence_quote\": \"row.status() == \\\"CANCELLED\\\"\",\n   \"criterion_id\": \"COR-1\"\n  },\n  {\n   \"path\": \"src/main/java/com/harbor/oms/search/OrderSearchService.java\",\n   \"line\": 44,\n   \"category\": \"correctness\",\n   \"claim\": \"A failed lookup is returned as an empty first page, so the desk sees 'no orders' instead of an error.\",\n   \"evidence_quote\": \"return new Page(Collections.emptyList(), 1, 1);\",\n   \"criterion_id\": \"COR-4\"\n  },\n  {\n   \"path\": \"src/main/java/com/harbor/oms/search/OrderSearchService.java\",\n   \"line\": 55,\n   \"category\": \"correctness\",\n   \"claim\": \"Integer division drops the last partial page: 30 rows give pageCount 1 although two pages exist.\",\n   \"evidence_quote\": \"int pageCount = visible.size() / PAGE_SIZE;\",\n   \"criterion_id\": \"COR-2\"\n  }\n ],\n \"passes_run\": [\n  \"correctness\"\n ]\n}",
+      "usage": {
+        "input_tokens": 3900,
+        "output_tokens": 330
+      }
+    }
+  ]
+}
