@@ -158,7 +158,12 @@ class SessionStore:
         if not os.path.lexists(path):
             raise SessionError(SessionReason.NOT_FOUND)
         try:
-            fd = os.open(path, os.O_RDONLY | _NOFOLLOW)
+            # `O_NONBLOCK` as well, and for the same reason `kit/core/sandbox.py` gives: a
+            # plain `O_RDONLY` on a fifo blocks *in the open*, so the `S_ISREG` refusal on the
+            # next line never runs and a CLI run has no timeout to save it. One fifo dropped in
+            # the session directory would hang `kit session list` for everyone. It costs a
+            # regular file nothing. `O_CLOEXEC` matches the foundation too.
+            fd = os.open(path, os.O_RDONLY | _NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
         except OSError:
             raise SessionError(SessionReason.INVALID) from None
         try:

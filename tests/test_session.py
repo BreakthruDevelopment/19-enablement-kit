@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import stat
 from datetime import UTC, datetime
+from importlib import import_module
 from pathlib import Path
 
 import pytest
@@ -19,9 +21,11 @@ from agent_container.core.loop import MAX_USER_MESSAGE_CHARS
 from agent_container.core.messages import (
     Message,
     ModelRequest,
+    ModelResponse,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
+    Usage,
 )
 
 from kit.cli import main
@@ -614,3 +618,172 @@ def test_cli_list_of_an_empty_directory_is_empty(
     monkeypatch.setenv("USER", "dev")
     assert main(["session", "list", "--dir", str(tmp_path)]) == 0
     assert capsys.readouterr().out == ""
+
+
+# --- Controls the review of 82dd5c0 found unexercised -------------------------------------------
+
+
+def _in_time(call: object, seconds: float = 8.0) -> SessionError:
+    """Run `call` on a thread and fail if it does not come back. A hang is the defect."""
+    import threading
+
+    box: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            call()  # type: ignore[operator]
+        except BaseException as err:
+            box.append(err)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    assert not worker.is_alive(), "the call never returned: it blocked in the open"
+    assert box and isinstance(box[0], SessionError), f"expected a refusal, got {box!r}"
+    return box[0]
+
+
+def test_a_fifo_in_the_session_directory_is_refused_and_does_not_hang(tmp_path: Path) -> None:
+    # `O_RDONLY` on a fifo blocks *in the open*, so the `S_ISREG` refusal never runs and a CLI
+    # run has no timeout. Without `O_NONBLOCK` this never returns, which is why the assertion is
+    # a watchdog rather than a `pytest.raises`: one fifo would hang `kit session list` for
+    # everyone with access to the directory.
+    os.mkfifo(tmp_path / f"{'e' * 32}.json")
+    store = _store(tmp_path)
+    refusal = _in_time(lambda: store.get(DEV, "e" * 32))
+    assert refusal.reason is SessionReason.INVALID
+    # And the same through the listing, which reads every file in the directory.
+    listing = _in_time(lambda: store.list_sessions(DEV))
+    assert listing.reason is SessionReason.INVALID
+
+
+def test_a_valid_session_over_the_byte_cap_is_refused(tmp_path: Path) -> None:
+    # The cap has three enforcement points and the old test could not fail any of them: its
+    # payload was `b"{" * (cap + 1)`, which is not JSON, so `_decode` refused it first and every
+    # cap could be deleted with the suite green. This file is *valid* -- a real session, padded
+    # inside its own JSON with whitespace -- so the size is the only thing wrong with it.
+    store = _store(tmp_path, times=(T0,))
+    session = store.create(DEV, _finished())
+    path = tmp_path / f"{session.id}.json"
+    body = json.loads(path.read_text(encoding="utf-8"))
+    raw = json.dumps(body, indent=2, sort_keys=True)
+    padded = raw.replace("\n", "\n" + " " * 64, 1)
+    while len(padded.encode("utf-8")) <= MAX_SESSION_BYTES:
+        padded = padded.replace("\n ", "\n" + " " * 4096, 1)
+    assert json.loads(padded) == body  # still the same session, just too big
+    path.write_text(padded, encoding="utf-8")
+    with pytest.raises(SessionError) as caught:
+        _store(tmp_path).get(DEV, session.id)
+    assert caught.value.reason is SessionReason.INVALID
+
+
+def test_a_directory_where_a_session_file_belongs_is_refused(tmp_path: Path) -> None:
+    # Without the `S_ISREG` check this is an uncaught `IsADirectoryError` out of the CLI.
+    (tmp_path / f"{'f' * 32}.json").mkdir()
+    with pytest.raises(SessionError) as caught:
+        _store(tmp_path).get(DEV, "f" * 32)
+    assert caught.value.reason is SessionReason.INVALID
+
+
+def test_a_hand_edited_file_with_two_turns_of_one_name_is_refused_on_read(
+    tmp_path: Path,
+) -> None:
+    # `_decode` re-runs `ensure_turns` because a file on disk is not what `append` validated.
+    # The tamper has to be one that *only* that call catches: a turn's own fields stay valid and
+    # `budget_spent` still matches, so neither the model's validators nor the budget check
+    # objects. Duplicate turn names are a cross-turn rule, which is exactly what `ensure_turns`
+    # is for. Without the call, `get` accepts a session whose turn names are ambiguous, and
+    # `fork <name>` then has two turns to choose from.
+    store = _store(tmp_path, times=(T0, T1))
+    session = store.create(DEV, _opening())
+    store.append(DEV, session.id, _later())
+    path = tmp_path / f"{session.id}.json"
+    body = json.loads(path.read_text(encoding="utf-8"))
+    assert [turn["name"] for turn in body["turns"]] == ["look", "done"]
+    body["turns"][1]["name"] = "look"
+    path.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with pytest.raises(SessionError) as caught:
+        _store(tmp_path).get(DEV, session.id)
+    assert caught.value.reason is SessionReason.INVALID
+    assert NOTE not in str(caught.value)
+
+
+def test_an_odd_user_name_becomes_a_usable_subject_and_is_not_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without the sanitiser, `USER='has space'` is an uncaught `KitError: principal.bad_subject`
+    # before the command does anything. Every form here must yield a principal, not a raise.
+    from kit.session.command import engineer_from_environment
+
+    for value, expected in (
+        ("has space", "hasspace"),
+        ("ada", "ada"),
+        ("", "engineer"),
+        ("!!!", "engineer"),
+        ("a" * 200, "a" * 64),
+        ("../../etc/passwd", "....etcpasswd"),
+    ):
+        monkeypatch.setenv("USER", value)
+        principal = engineer_from_environment()
+        assert principal.subject == expected
+    monkeypatch.delenv("USER", raising=False)
+    assert engineer_from_environment().subject == "engineer"
+
+
+def test_a_replay_that_does_not_match_the_recording_is_divergence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `SessionReason.DIVERGED` is the guard that resume replayed the session it was given and
+    # not something else. It appeared nowhere in this file, and deleting the comparison left the
+    # suite green. The recording on disk stays valid -- `_decode` re-derives `budget_spent` from
+    # the turns, so tampering with the file would be refused earlier and prove nothing. Instead
+    # the replies the provider hands back bill more than the turns recorded, which is exactly
+    # the shape of a recording that no longer describes the run.
+    _no_model(monkeypatch)
+    store = _store(tmp_path, times=(T0,))
+    session = store.create(DEV, _finished())
+
+    # `kit.session` re-exports the `resume` function under the module's own name, so the module
+    # has to be fetched from `sys.modules` rather than imported by attribute.
+    resume_module = import_module("kit.session.resume")
+
+    honest = resume_module._reply
+
+    def inflated(turn: object) -> object:
+        reply = honest(turn)
+        return ModelResponse.of(
+            reply.text,
+            stop_reason=reply.stop_reason,
+            tool_uses=list(reply.tool_uses),
+            usage=Usage(reply.usage.input_tokens + 7, reply.usage.output_tokens),
+        )
+
+    monkeypatch.setattr(resume_module, "_reply", inflated)
+    with pytest.raises(SessionError) as caught:
+        asyncio.run(resume(store, DEV, session.id))
+    assert caught.value.reason is SessionReason.DIVERGED
+    assert NOTE not in str(caught.value)
+
+
+def test_a_transcript_bedrock_would_reject_is_not_resumed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `SessionReason.UNSENDABLE` is the other reason that appeared nowhere. `transcript_is_sendable`
+    # itself is tested; what was not is that resume *consults* it and refuses. `ensure_turns`
+    # makes an unsendable transcript unreachable through valid stored data, so the check is
+    # pinned at its call site: with the sendability answer forced to False, resume must refuse
+    # rather than report a successful replay.
+    _no_model(monkeypatch)
+    store = _store(tmp_path, times=(T0,))
+    session = store.create(DEV, _finished())
+    assert asyncio.run(resume(store, DEV, session.id)).session_id == session.id  # sendable today
+
+    # `kit.session` re-exports the `resume` function under the module's own name, so the module
+    # has to be fetched from `sys.modules` rather than imported by attribute.
+    resume_module = import_module("kit.session.resume")
+
+    monkeypatch.setattr(resume_module, "transcript_is_sendable", lambda _messages: False)
+    with pytest.raises(SessionError) as caught:
+        asyncio.run(resume(store, DEV, session.id))
+    assert caught.value.reason is SessionReason.UNSENDABLE
+    assert NOTE not in str(caught.value)
