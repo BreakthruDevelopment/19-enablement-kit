@@ -41,6 +41,7 @@ from agent_container.core.provider import ModelProvider
 from kit.review.criteria import BLOCKING_SEVERITIES, Criteria, Severity
 from kit.review.inputs import check_diff
 from kit.review.passes import (
+    CallGate,
     PassResult,
     PassStatus,
     RecordedFinding,
@@ -92,6 +93,7 @@ class PresentedFinding:
 
     lead: RecordedFinding
     merged: tuple[RecordedFinding, ...] = ()
+    lead_index: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,8 +119,18 @@ class ReviewResult:
 
     @property
     def complete(self) -> bool:
-        """False if any pass never got a parseable response. An incomplete run posts nothing."""
-        return not self.failed
+        """False if a *finding* pass never got a parseable response; an incomplete run posts
+        nothing.
+
+        Consolidation is excluded deliberately. It raises no findings and can only affect the
+        order and grouping of the display, so a throttle on the fifth call must not discard the
+        review the first four paid for -- and it is prompted with the diff, so a contributor who
+        could make it fail would otherwise have a one-call route to silencing the whole report.
+        When it fails, the presented set is simply unranked.
+        """
+        return not any(
+            p.status is PassStatus.FAILED and p.name in FINDING_PASSES for p in self.passes
+        )
 
 
 def compute_blocking(passes: Sequence[PassResult], recorded: Sequence[RecordedFinding]) -> bool:
@@ -138,13 +150,17 @@ def build_presented(
 ) -> tuple[PresentedFinding, ...]:
     """Merge and rank for display. Consolidation proposes; code disposes.
 
-    * Only findings on the **same path** merge, and a group's lead is its **most severe** member, so
-      a merge can never show a major finding as a minor one.
+    * Only findings on the **same path** merge, and a group's lead is its **most severe** member,
+      so a merge can never show a major finding as a minor one. Ties are broken by **recorded
+      index**, not by the order consolidation listed its members in: that order is a model's, and
+      with two findings of one severity on one path it would otherwise choose which claim and
+      which quote the report shows -- a decoy's text in place of a real finding's.
     * An index that is out of range or already used is ignored, and a finding no group mentions is
       still shown. Consolidation cannot make a finding disappear from the report either.
-    * The order is by severity first and consolidation's ranking second, so a hostile or lazy
-      ranking
-      cannot push a critical finding below the trim.
+    * The order is by severity first and **recorded index** second. Consolidation's ranking is not
+      used for ordering: within one severity class it would otherwise decide which findings
+      survive the display trim, and thirty-one criticals with a hostile grouping can push a real
+      one off the end.
     """
     count = len(recorded)
     assigned: set[int] = set()
@@ -155,13 +171,17 @@ def build_presented(
         for i in members:
             by_path.setdefault(recorded[i].finding.path, []).append(i)
         for bucket in by_path.values():
-            lead = min(bucket, key=lambda i: _SEVERITY_RANK[recorded[i].severity])
+            lead = min(bucket, key=lambda i: (_SEVERITY_RANK[recorded[i].severity], i))
             items.append(
-                PresentedFinding(recorded[lead], tuple(recorded[i] for i in bucket if i != lead))
+                PresentedFinding(
+                    recorded[lead],
+                    tuple(recorded[i] for i in sorted(bucket) if i != lead),
+                    lead,
+                )
             )
             assigned.update(bucket)
-    items.extend(PresentedFinding(recorded[i]) for i in range(count) if i not in assigned)
-    items.sort(key=lambda item: _SEVERITY_RANK[item.lead.severity])  # stable
+    items.extend(PresentedFinding(recorded[i], (), i) for i in range(count) if i not in assigned)
+    items.sort(key=lambda item: (_SEVERITY_RANK[item.lead.severity], item.lead_index))
     return tuple(items)
 
 
@@ -191,9 +211,11 @@ async def run_review(
     run_budget.start()
     run_nonce = nonce if nonce is not None else secrets.token_hex(8)
 
+    gate = CallGate(run_budget)
+
     async def finding_pass(name: PassName, prior: Sequence[RecordedFinding]) -> PassResult:
         return await run_finding_pass(
-            name, providers.for_pass(name), run_budget, criteria[name], diff, run_nonce, prior
+            name, providers.for_pass(name), gate, criteria[name], diff, run_nonce, prior
         )
 
     results: list[PassResult] = []
@@ -218,7 +240,7 @@ async def run_review(
     if recorded and run_complete:
         consolidation, groups = await run_consolidation(
             providers.for_pass(PassName.CONSOLIDATION),
-            run_budget,
+            gate,
             tuple(recorded),
             diff,
             run_nonce,

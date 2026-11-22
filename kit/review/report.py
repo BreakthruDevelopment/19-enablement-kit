@@ -52,9 +52,14 @@ def _item(item: PresentedFinding) -> list[str]:
         f"{_where(lead)} ({lead.pass_name.value}): {_one_line(lead.finding.claim)}",
         *(f"  {line}" for line in _quote(lead.finding.evidence_quote)),
     ]
-    if item.merged:
-        also = ", ".join(sorted({m.pass_name.value for m in item.merged}))
-        out.append(f"  Also raised by: {also}.")
+    for m in item.merged:
+        # Each merged finding keeps its own criterion and line: a merge groups what consolidation
+        # says is one problem, and showing only the lead's text would let a grouping replace a
+        # real finding's claim with a decoy's.
+        out.append(
+            f"  Also: **{m.severity.value}** {_one_line(m.finding.criterion_id)} "
+            f"{_where(m)} ({m.pass_name.value})"
+        )
     return out
 
 

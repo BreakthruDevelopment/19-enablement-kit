@@ -24,6 +24,20 @@ from typing import Annotated, Any, Final, Literal, NoReturn
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
+
+class PassOverflow(Exception):
+    """A well-shaped reply whose `findings` list is longer than the schema allows.
+
+    The schema's bound (50) sits deliberately above the per-pass cap (40) so a 41st finding
+    arrives schema-valid and code can reject the pass as overflow rather than see a parse failure.
+    A 51st would fall off that design: pydantic would refuse it, `parse_pass_output` would report
+    "nothing parseable came back", and the pass would *fail* -- which posts nothing at all. One
+    pass talked into listing nits would then silence a run in which another pass recorded a
+    critical finding, which is the injection-to-silence attack the per-pass cap exists to defeat.
+    So the over-bound case is raised here and rejected like any other overflow.
+    """
+
+
 __all__ = [
     "MAX_FINDINGS_PER_PASS",
     "MAX_FINDINGS_SCHEMA",
@@ -115,6 +129,9 @@ def parse_pass_output(text: str) -> PassOutput | None:
     data = _load_object(text)
     if data is None:
         return None
+    findings_value = data.get("findings")
+    if isinstance(findings_value, list) and len(findings_value) > MAX_FINDINGS_SCHEMA:
+        raise PassOverflow
     for key in _DISCARDED:
         data.pop(key, None)
     findings = data.get("findings")

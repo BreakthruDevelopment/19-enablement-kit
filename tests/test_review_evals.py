@@ -97,9 +97,15 @@ def test_demo_finds_the_three_defects_with_verbatim_quotes() -> None:
     for quote, criterion in [(SQLI_QUOTE, "SEC-1"), (EQ_QUOTE, "COR-1"), (SWALLOW_QUOTE, "RUL-3")]:
         assert quote in diff
         assert criterion in cited[quote]
-    # The recorded set keeps every pass's duplicates by design, so the "no more than two beyond the
-    # three" row is measured on the presented set.
+    # The recorded set keeps every pass's duplicates by design, so the "no more than two beyond
+    # the three" half of the row is measured on the presented set -- where each merged finding
+    # keeps its own criterion, so a defect grouped under another's lead is still named.
     assert len(result.presented) <= 5
+    shown = {r.finding.criterion_id for item in result.presented for r in (item.lead, *item.merged)}
+    assert {"SEC-1", "COR-1", "RUL-3"} <= shown
+    body = render_report(result)
+    for criterion in ("SEC-1", "COR-1", "RUL-3"):
+        assert criterion in body
     assert result.verdict == "blocking"
 
 
@@ -240,14 +246,33 @@ def test_forty_findings_is_inside_the_cap() -> None:
     assert result.verdict is None
 
 
-def test_fifty_one_findings_fails_the_schema_and_is_a_failed_pass_not_a_rejected_one() -> None:
+def test_a_reply_over_the_schema_bound_is_overflow_not_a_parse_failure() -> None:
+    # The 40/50 gap makes a 41st finding a rejection rather than a parse failure. A 51st would
+    # fall off that design -- pydantic refuses it, so it would read as "nothing parseable came
+    # back", the pass would *fail*, and a failed pass posts nothing at all. One pass talked into
+    # listing nits would then silence a run in which another pass recorded a critical finding.
     providers, _ = scripted(security=reply(_minor_findings(51)))
     result = run(demo_diff(), providers)
     security = result.passes[1]
-    assert security.status is PassStatus.FAILED
-    assert security.reasons == ("not_parseable",)
-    assert not result.complete
-    assert result.verdict is None
+    assert security.status is PassStatus.REJECTED
+    assert security.reasons == ("overflow",)
+    assert result.complete  # so there is still a report
+    assert result.verdict == "blocking"
+
+
+def test_a_silencing_overflow_cannot_bury_another_passs_real_finding() -> None:
+    # The attack the 40/50 gap exists to defeat, one step over: a pass talked into listing nits
+    # past the schema bound, while another pass has recorded a real defect.
+    providers, _ = scripted(
+        correctness=reply([finding(EQ_QUOTE, "COR-1")]),
+        security=reply(_minor_findings(51)),
+    )
+    result = run(demo_diff(), providers)
+    assert [r.finding.criterion_id for r in result.recorded] == ["COR-1"]
+    assert result.complete and result.verdict == "blocking"
+    body = render_report(result)
+    assert "COR-1" in body
+    assert "Kit-Verdict: blocking" in body
 
 
 # --- Eval row: a throttling provider error ------------------------------------------------------
@@ -631,3 +656,57 @@ def test_kit_review_is_wired_into_the_cli(capsys: pytest.CaptureFixture[str]) ->
     code = main(["review", str(DEMO / "change.diff"), "--criteria", str(CRITERIA_DIR)])
     assert code == 0
     assert capsys.readouterr().out.startswith("Kit-Review: pr-review\n")
+
+
+# --- What the review of this slice found: silence channels, and a model choosing the display ----
+
+
+def test_a_failing_consolidation_does_not_discard_the_review() -> None:
+    # Consolidation raises no findings and can only affect the display, so a throttle on the
+    # fifth call must not throw away the review the first four paid for. It is also prompted with
+    # the diff, so a contributor who could make it fail would otherwise have a one-call route to
+    # silencing the whole report.
+    for broken in (RuntimeError("Throttling"), ModelResponse.of("SKIP")):
+        providers, _ = scripted(
+            security=reply([finding(SQLI_QUOTE, "SEC-1")]), consolidation=broken
+        )
+        result = run(demo_diff(), providers)
+        assert [r.finding.criterion_id for r in result.recorded] == ["SEC-1"]
+        assert result.complete, broken
+        assert result.verdict == "blocking"
+        # Unranked, but posted.
+        body = render_report(result)
+        assert "SEC-1" in body
+        consolidation = next(p for p in result.passes if p.name is PassName.CONSOLIDATION)
+        assert consolidation.status is PassStatus.FAILED
+
+
+def test_a_failing_finding_pass_still_makes_the_run_incomplete() -> None:
+    # The other side of the line above: a *finding* pass that got nothing back means the run
+    # cannot be reported, which is the spec's throttle row.
+    providers, _ = scripted(security=RuntimeError("Throttling"))
+    result = run(demo_diff(), providers)
+    assert not result.complete
+    with pytest.raises(ValueError):
+        render_report(result)
+
+
+def test_two_concurrent_passes_cannot_spend_one_turn_twice() -> None:
+    # App 17 checks a budget before a call and spends it after, and says a coordinator that needs
+    # a hard cap must limit how many calls run at once. The correctness and security passes run
+    # concurrently, so without a reservation both pass a one-turn check.
+    providers, made = scripted()
+    result = run(demo_diff(), providers, budget=Budget(max_turns=1, max_tokens=10_000))
+    calls = sum(len(s.requests) for s in made.values())
+    assert calls == 1
+    assert result.passes[0].status is PassStatus.OK
+    assert result.passes[1].status is PassStatus.FAILED
+    assert result.passes[1].reasons == ("budget_exhausted",)
+
+
+def test_a_turn_is_given_back_when_no_call_was_billed() -> None:
+    # A provider error costs no turn, so the reservation must be released without charging one.
+    providers, made = scripted(correctness=RuntimeError("Throttling"))
+    run(demo_diff(), providers, budget=Budget(max_turns=2, max_tokens=10_000))
+    assert len(made[PassName.SECURITY].requests) == 1
+    assert len(made[PassName.PROJECT_RULES].requests) == 1

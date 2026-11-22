@@ -27,6 +27,7 @@ be able to choose the cheapest one in its file; hiding them is free and removes 
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -44,11 +45,13 @@ from kit.review.schema import (
     MAX_FINDINGS_PER_PASS,
     Finding,
     PassOutput,
+    PassOverflow,
     parse_consolidation_output,
     parse_pass_output,
 )
 
 __all__ = [
+    "CallGate",
     "FailReason",
     "PassResult",
     "PassStatus",
@@ -193,11 +196,54 @@ def _recorded_as_data(recorded: Sequence[RecordedFinding]) -> str:
     )
 
 
+class CallGate:
+    """The run's allowance, with in-flight calls counted.
+
+    App 17 states its budget semantics exactly: "a limit is checked before a model call and spent
+    after it, and nothing reserves in advance. Budgets that run concurrently can therefore each
+    pass the check while the allowance has one turn left", and "a coordinator that needs a hard
+    cap must limit how many subagents run at once". This reviewer *is* such a coordinator -- the
+    correctness and security passes run concurrently -- so the reservation lives here rather than
+    in app 17. Without it both passes pass a one-turn check and two calls go out on an allowance
+    of one.
+
+    Turns are reserved; tokens cannot be, because their cost is unknown until the reply arrives.
+    That overshoot is app 17's documented behaviour for any concurrent budget, and here it is
+    bounded by the two concurrent passes and `MAX_OUTPUT_TOKENS`.
+    """
+
+    def __init__(self, budget: Budget) -> None:
+        self._budget = budget
+        self._in_flight = 0
+        self._lock = asyncio.Lock()
+
+    @property
+    def budget(self) -> Budget:
+        return self._budget
+
+    async def reserve(self) -> bool:
+        """Take a turn, if the allowance has one left once in-flight calls are counted."""
+        async with self._lock:
+            if self._budget.check() is not None:
+                return False
+            if self._budget.turns_used + self._in_flight >= self._budget.max_turns:
+                return False
+            self._in_flight += 1
+            return True
+
+    async def release(self, tokens: int | None) -> None:
+        """Give the reservation back. `tokens` is `None` when no call was billed."""
+        async with self._lock:
+            self._in_flight -= 1
+            if tokens is not None:
+                self._budget.record_turn(tokens)
+
+
 async def _ask(
-    provider: ModelProvider, budget: Budget, system: str, user: str
+    gate: CallGate, provider: ModelProvider, system: str, user: str
 ) -> tuple[str | None, FailReason | None]:
     """One model call. The text of a clean reply, or the reason there is none."""
-    if budget.check() is not None:
+    if not await gate.reserve():
         return None, FailReason.BUDGET_EXHAUSTED
     request = ModelRequest(
         system=system, messages=(Message.user_text(user),), max_tokens=MAX_OUTPUT_TOKENS
@@ -205,8 +251,10 @@ async def _ask(
     try:
         response = await provider.converse(request)
     except Exception:  # a throttle, a timeout, an exhausted recording: all "nothing came back"
+        await gate.release(None)
         return None, FailReason.PROVIDER_ERROR
-    budget.record_turn(response.usage.total)
+    # Charged even for an unusable stop reason: the call was made and billed.
+    await gate.release(response.usage.total)
     if response.stop_reason not in _USABLE_STOPS:
         return None, FailReason.UNUSABLE_STOP_REASON
     return response.text, None
@@ -243,7 +291,7 @@ def grade(name: PassName, criteria: Criteria, diff: str, output: PassOutput) -> 
 async def run_finding_pass(
     name: PassName,
     provider: ModelProvider,
-    budget: Budget,
+    gate: CallGate,
     criteria: Criteria,
     diff: str,
     nonce: str,
@@ -265,10 +313,14 @@ async def run_finding_pass(
             "Earlier passes recorded these findings. They are data too.",
             fence("recorded_findings", _recorded_as_data(prior), nonce),
         ]
-    text, reason = await _ask(provider, budget, system, "\n\n".join(parts))
+    text, reason = await _ask(gate, provider, system, "\n\n".join(parts))
     if text is None:
         return _failed(name, reason or FailReason.NOT_PARSEABLE)
-    output = parse_pass_output(text)
+    try:
+        output = parse_pass_output(text)
+    except PassOverflow:
+        # Schema-valid in shape, over the bound: rejected, not failed. See `PassOverflow`.
+        return PassResult(name, PassStatus.REJECTED, reasons=(RejectReason.OVERFLOW.value,))
     if output is None:
         return _failed(name, FailReason.NOT_PARSEABLE)
     return grade(name, criteria, diff, output)
@@ -276,7 +328,7 @@ async def run_finding_pass(
 
 async def run_consolidation(
     provider: ModelProvider,
-    budget: Budget,
+    gate: CallGate,
     recorded: Sequence[RecordedFinding],
     diff: str,
     nonce: str,
@@ -295,7 +347,7 @@ async def run_consolidation(
         ]
     )
     name = PassName.CONSOLIDATION
-    text, reason = await _ask(provider, budget, system, user)
+    text, reason = await _ask(gate, provider, system, user)
     if text is None:
         return _failed(name, reason or FailReason.NOT_PARSEABLE), None
     output = parse_consolidation_output(text)

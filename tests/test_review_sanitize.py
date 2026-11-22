@@ -14,11 +14,20 @@ import pytest
 
 from kit.review import ReviewError, ReviewReason, assert_body_safe, reads_as_signoff
 
-# A model of the gate, used only to prove the table's attacks are real: each attack below is
-# read by this pattern once JavaScript's terminators and whitespace are applied to it.
+# A model of the gate, used only to prove the table's attacks are real. The whitespace class is
+# written out as **JavaScript's** `\s` -- the ECMAScript WhiteSpace and LineTerminator sets --
+# rather than reusing the implementation's `[\s\ufeff]`, which would make this a copy of the thing
+# under test instead of an oracle for it. Python's `\s` additionally matches U+001C-U+001F and
+# U+0085, which JavaScript does not; leaving those out is what lets the table show that the kit
+# refuses *more* than the gate reads, and never less.
+_JS_SPACE = (
+    "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008"
+    "\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+)
 _GATE_TERMINATORS = re.compile(r"\r\n|[\r\u2028\u2029]")
 _GATE = re.compile(
-    r"^[\s\ufeff]*\**Reviewer\**[\s\ufeff]*:[\s\ufeff]*\**[\s\ufeff]*([a-z-]+)", re.M | re.I
+    rf"^[{_JS_SPACE}]*\**Reviewer\**[{_JS_SPACE}]*:[{_JS_SPACE}]*\**[{_JS_SPACE}]*([a-z-]+)",
+    re.M | re.I,
 )
 
 
@@ -140,7 +149,7 @@ def test_the_kit_never_accepts_what_the_gate_reads() -> None:
         for key in keys:
             for before in separators:
                 for after in separators:
-                    body = f"text\n{prefix}{key}{before}:{after}{values[0]}"
-                    if gate_reads(body):
-                        assert reads_as_signoff(body), repr(body)
-    assert values  # the value alphabet is exercised by the table above
+                    for value in values:
+                        body = f"text\n{prefix}{key}{before}:{after}{value}"
+                        if gate_reads(body):
+                            assert reads_as_signoff(body), repr(body)
