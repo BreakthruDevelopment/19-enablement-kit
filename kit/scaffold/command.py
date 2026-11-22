@@ -48,9 +48,12 @@ class NewInvocation(BaseModel):
 _KNOWN: Final = known_fields(NewInvocation)
 
 
-def register_new(parser: argparse.ArgumentParser) -> None:
-    """Add the `new` subcommand. The default principal cannot write."""
-    commands = parser.add_subparsers(dest="command")
+def register_new(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add the `new` subcommand to the CLI's one subparser group.
+
+    The group is passed in rather than created here: argparse allows a parser only one, and
+    `kit` has several slices' commands on it. The default principal cannot write.
+    """
     new = commands.add_parser(
         "new",
         help="Write a scaffold into a target directory.",
