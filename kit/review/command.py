@@ -31,7 +31,7 @@ from kit.core.config import SandboxLimits
 from kit.core.errors import KitError
 from kit.core.principals import Capability, Principal, assert_can
 from kit.core.sandbox import Sandbox
-from kit.review.criteria import load_criteria
+from kit.review.criteria import BLOCKING_SEVERITIES, load_criteria
 from kit.review.errors import ReviewError
 from kit.review.inputs import MAX_DIFF_BYTES
 from kit.review.pipeline import run_review
@@ -89,10 +89,16 @@ def run_review_command(
             f"kit review: could not complete; no response from: {names}. Nothing was posted.",
             file=err,
         )
-        if result.blocking:
+        if any(r.severity in BLOCKING_SEVERITIES for r in result.recorded):
             # The one degraded case worth stating out loud: a pass got nothing back, so nothing
             # is posted, *and* what the other passes did record would have blocked. Printing only
             # the failed pass names would let that pass unnoticed.
+            #
+            # Read from the recorded set, not from `result.blocking`: a *rejected* pass makes the
+            # run blocking by itself, so a pass that overflowed and whose findings then all failed
+            # the quote check would otherwise print "already on record" with nothing on record at
+            # all -- a false statement about the run, which is the defect this commit is removing
+            # from the report and must not reintroduce on stderr.
             print(
                 "kit review: findings that would have blocked are already on record"
                 f" ({len(result.recorded)} in all); re-run when the provider answers.",

@@ -769,6 +769,69 @@ def test_a_degraded_run_does_not_claim_consolidation_ranked_anything() -> None:
     assert "neither merged nor ranked" not in ranked
 
 
+def _replies_dir(where: Path, texts: dict[PassName, str | None]) -> Path:
+    """A replay directory: a reply text per pass, or `None` for an exhausted (failing) one."""
+    where.mkdir()
+    for name, text in texts.items():
+        body: dict[str, object] = {"replies": []}
+        if text is not None:
+            body = {"replies": [{"stop_reason": "end_turn", "text": text}]}
+        (where / f"{name.value}.json").write_text(json.dumps(body))
+    return where
+
+
+def _incomplete_run_stderr(where: Path, security_text: str) -> str:
+    empty = '{"findings": []}'
+    texts: dict[PassName, str | None] = {
+        PassName.CORRECTNESS: None,  # exhausted: the run cannot complete
+        PassName.SECURITY: security_text,
+        PassName.PROJECT_RULES: empty,
+        PassName.TESTS_COVERAGE: empty,
+        PassName.CONSOLIDATION: '{"groups": []}',
+    }
+    out, err = io.StringIO(), io.StringIO()
+    code = run_review_command(
+        DEMO / "change.diff",
+        principal=Principal.engineer("tester"),
+        replay_dir=_replies_dir(where, texts),
+        criteria_dir=CRITERIA_DIR,
+        out=out,
+        err=err,
+    )
+    assert code == 1
+    assert out.getvalue() == ""
+    assert "could not complete" in err.getvalue()
+    return err.getvalue()
+
+
+def test_an_incomplete_run_says_so_only_when_a_blocking_finding_is_on_record(
+    tmp_path: Path,
+) -> None:
+    # An incomplete run prints nothing to stdout by design, and a hostile diff tripping a content
+    # filter is the one content-triggered route to one left: that silence must not read like a
+    # clean review when the passes that did answer had already found something that blocks.
+    recorded = json.dumps({"findings": [finding(SQLI_QUOTE, "SEC-1")]})
+    assert "already on record" in _incomplete_run_stderr(tmp_path / "blocking", recorded)
+
+    # Nothing found: just silence, with no claim about a record that is empty.
+    assert "already on record" not in _incomplete_run_stderr(tmp_path / "clean", '{"findings": []}')
+
+    # And the case `result.blocking` gets wrong. Fifty-one findings is an overflow, which rejects
+    # the pass and makes the run blocking on its own; every quote here is absent from the diff, so
+    # each finding is dropped and the recorded set is empty. Reading `blocking` would announce
+    # findings on record with none there.
+    absent = json.dumps(
+        {
+            "findings": [
+                finding("THIS QUOTE IS NOT IN THE DIFF", "SEC-4", line=i + 1)
+                for i in range(MAX_FINDINGS_SCHEMA + 1)
+            ]
+        }
+    )
+    stderr = _incomplete_run_stderr(tmp_path / "rejected", absent)
+    assert "already on record" not in stderr
+
+
 def test_the_report_is_refused_when_the_body_could_satisfy_the_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
