@@ -1,0 +1,117 @@
+{
+  "contract_version": 1,
+  "source": "ai-dev-os specs/18-procure-to-pay.md, 'The simulated ERP and the MCP gateway'",
+  "frozen_on": "2026-11-22",
+  "server": {
+    "name": "p2p-erp",
+    "transport": "stdio"
+  },
+  "tools": [
+    {
+      "name": "find_supplier",
+      "effect": "read",
+      "roles": [
+        "approver",
+        "clerk",
+        "disputes",
+        "service"
+      ],
+      "summary": "Find suppliers, scoped to the caller's company code; results capped and paged."
+    },
+    {
+      "name": "get_goods_receipt",
+      "effect": "read",
+      "roles": [
+        "approver",
+        "clerk",
+        "disputes",
+        "service"
+      ],
+      "summary": "One goods receipt, scoped to the caller's company code."
+    },
+    {
+      "name": "get_invoice",
+      "effect": "read",
+      "roles": [
+        "approver",
+        "clerk",
+        "disputes",
+        "service"
+      ],
+      "summary": "One invoice, scoped to the caller's company code."
+    },
+    {
+      "name": "get_payment_status",
+      "effect": "read",
+      "roles": [
+        "approver",
+        "clerk",
+        "disputes",
+        "service"
+      ],
+      "summary": "The payment status of one invoice, scoped to the caller's company code."
+    },
+    {
+      "name": "get_purchase_order",
+      "effect": "read",
+      "roles": [
+        "approver",
+        "clerk",
+        "disputes",
+        "service"
+      ],
+      "summary": "One purchase order, scoped to the caller's company code."
+    },
+    {
+      "name": "hold_payment",
+      "effect": "write",
+      "roles": [
+        "disputes"
+      ],
+      "summary": "Stage a payment hold. Never acts: returns a staged change and the hld_ change key of the row it recorded."
+    },
+    {
+      "name": "issue_credit_memo",
+      "effect": "write",
+      "roles": [
+        "disputes"
+      ],
+      "summary": "Stage a credit memo. Never acts: returns a staged change and the crd_ change key of the row it recorded."
+    },
+    {
+      "name": "list_open_invoices",
+      "effect": "read",
+      "roles": [
+        "approver",
+        "clerk",
+        "disputes",
+        "service"
+      ],
+      "summary": "Open invoices, scoped to the caller's company code; results capped and paged."
+    },
+    {
+      "name": "post_invoice",
+      "effect": "write",
+      "roles": [
+        "clerk"
+      ],
+      "summary": "Stage an invoice posting. Never acts: returns a staged change and the pst_ change key of the row it recorded."
+    }
+  ],
+  "errors": {
+    "fields": [
+      "error_category",
+      "is_retryable"
+    ],
+    "categories": [
+      "transient",
+      "validation",
+      "permission",
+      "business",
+      "internal"
+    ],
+    "retryable_categories": [
+      "transient"
+    ]
+  }
+}
