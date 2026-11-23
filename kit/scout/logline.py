@@ -8,10 +8,18 @@ own keys.
 
 The key set is closed and the values are checked here rather than at the call sites, which is the
 point: every value a scout log line can carry is a count, an `ErrorCode`-style token or one of a
-closed set of words. A path, a model's text, a deny-list pattern or an exception message cannot
+closed set of words. A path, a sentence, a quote, a dotfile name or an exception message cannot
 reach a log line even if a later caller passes one by mistake -- it is replaced by `INVALID`. That
 is the property `build_unread_reason` holds for `coverage.unread_reason`, enforced the same way,
 because a log line is as readable as a brief.
+
+Stated as a narrowing rather than as an absolute, because that is what it is: a bare dotted
+lower-case word of 64 characters or less is a token, so `build.xml`, `id_rsa` and `secrets` -- one
+of the sandbox's six `DENY_PATTERNS` -- would all survive the filter if a call site ever passed
+one. None can today: the key set is closed and the three call sites pass only enum values and
+counts. The filter is what stops a *path* or a *message*; it is not a secret detector, and a
+comment that claimed otherwise is the same mistake as the `MAX_SEARCHED_LINE` comment this file's
+own commit corrected.
 """
 
 from __future__ import annotations

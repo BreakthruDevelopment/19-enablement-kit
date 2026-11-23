@@ -637,12 +637,18 @@ def test_the_input_is_capped_by_construction_and_what_did_not_fit_is_reported(
     assert len(re.findall(r"<[a-z_]+ fence=", user)) == len(re.findall(r"</[a-z_]+ fence=", user))
 
 
-def test_a_provider_error_is_a_failed_run_not_a_brief() -> None:
+def test_a_provider_error_is_a_failed_run_not_a_brief(caplog: pytest.LogCaptureFixture) -> None:
     for failure in (RuntimeError("throttled"), TimeoutError()):
-        with pytest.raises(ScoutError) as caught:
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="kit.scout"), pytest.raises(ScoutError) as caught:
             scout(SAMPLE, Scripted(failure))
         assert caught.value.reason is ScoutReason.PROVIDER_ERROR
         assert "throttled" not in str(caught.value)
+        # The third log call site, pinned here rather than left to a future refactor: the review
+        # of f225e2f found this one was the only `log.*` in the package no test held. The line
+        # carries no values, so there is nothing to leak -- what is worth holding is the format.
+        assert json.loads(caplog.records[-1].getMessage()) == {"event": "scout.provider_error"}
+        assert "throttled" not in caplog.text
 
 
 def test_an_unusable_stop_reason_is_a_failed_run() -> None:
