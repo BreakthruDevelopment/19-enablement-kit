@@ -11,6 +11,7 @@ import ast
 import asyncio
 import io
 import json
+import logging
 import re
 import time
 from collections.abc import Callable
@@ -57,6 +58,7 @@ from kit.scout import (
     run_scout_command,
 )
 from kit.scout.explore import ROLLING_SUMMARY_CHARS, SIGNALS, kind_of, references, signal_lines
+from kit.scout.logline import FIELDS, INVALID, log_line
 from kit.scout.pipeline import assert_brief_clean, build_unread_reason
 from kit.scout.prompt import MAX_PROMPT_CHARS, SYSTEM_PROMPT
 from kit.scout.schema import MAX_FINDINGS, ScoutBrief, parse_brief
@@ -328,7 +330,15 @@ def test_a_finding_citing_a_file_the_sandbox_never_served_is_dropped_and_logged(
     assert [(d.section, d.index, d.reason) for d in dropped] == [
         ("findings", 0, DropReason.UNSERVED_FILE)
     ]
-    assert "scout.entry_dropped section=findings index=0 reason=unserved_file" in caplog.text
+    # One JSON object with fixed fields, per `AGENTS.md`. Parsed rather than matched as a
+    # substring, so a return to plain text fails here.
+    body = json.loads(caplog.records[-1].getMessage())
+    assert body == {
+        "event": "scout.entry_dropped",
+        "section": "findings",
+        "index": 0,
+        "reason": "unserved_file",
+    }
     # The log carries a position and a fixed word, not the model's text.
     assert "Never" not in caplog.text and GOOD_QUOTE not in caplog.text
 
@@ -824,3 +834,125 @@ def test_the_scout_package_touches_the_filesystem_only_through_the_sandbox() -> 
 def test_a_scout_explores_exactly_one_root() -> None:
     with pytest.raises(ValueError):
         Explorer(Sandbox(ENGINEER, [SAMPLE, SAMPLE / "sql"]))
+
+
+# --- Findings from the gate-3 review of 431463d --------------------------------------------------
+
+
+def test_only_the_last_step_may_say_the_run_is_stopping(tmp_path: Path) -> None:
+    # `_annotate_next` has to run *after* the file's own references are enqueued. Before it, a read
+    # that empties the queue and then discovers something records `stop: nothing left ...` and is
+    # then followed by another read, so the per-step record -- this slice's whole deliverable for
+    # statement 5.4 -- contradicts the run it describes.
+    #
+    # The sample never triggers it: four seeds keep the queue non-empty, which is exactly why the
+    # rest of the suite missed it. This root has one seed naming one directory holding one class,
+    # so reading the seed empties the queue before the class is found.
+    root = tmp_path / "thin"
+    (root / "src" / "com" / "acme").mkdir(parents=True)
+    (root / "build.xml").write_text(
+        '<project name="thin"><property name="src" value="src/com/acme"/></project>\n',
+        encoding="utf-8",
+    )
+    (root / "src" / "com" / "acme" / "Thing.java").write_text(
+        "package com.acme;\npublic class Thing { void run() { } }\n", encoding="utf-8"
+    )
+
+    steps = _explored(root).steps
+    reads = [step for step in steps if step.action == "read"]
+    assert len(reads) >= 2, "the fixture must read the seed and then the class it names"
+    assert reads[-1].target.endswith("Thing.java")
+    stopping = [step.number for step in steps if step.next.startswith("stop:")]
+    assert stopping == [steps[-1].number], (
+        "a step before the last says the run is stopping, and then the run read on: "
+        f"steps saying stop = {stopping}, last step = {steps[-1].number}"
+    )
+    # And the step that discovered the class says so, rather than saying it is stopping.
+    discovered = next(step for step in steps if step.target.endswith("build.xml"))
+    assert discovered.next == "read src/com/acme/Thing.java: named by build.xml"
+
+
+def test_a_scout_log_line_is_json_with_fixed_fields() -> None:
+    # `AGENTS.md`: "Logs: JSON lines with fixed fields." Every value is a count or a token, checked
+    # in `log_line` rather than at the call sites, so a later caller cannot widen it.
+    line = log_line("scout.done", files_read=48, files_total=51, findings=4, dropped=0)
+    assert json.loads(line) == {
+        "event": "scout.done",
+        "files_read": 48,
+        "files_total": 51,
+        "findings": 4,
+        "dropped": 0,
+    }
+    assert "\n" not in line
+    assert set(json.loads(log_line("scout.provider_error"))) == {"event"}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/etc/passwd",
+        "src/com/harbor/oms/dao/OrderDao.java",
+        ".env",
+        "a quote from the model's reply",
+        "AKIAIOSFODNN7EXAMPLE",
+        "x" * 65,
+        True,
+        -1,
+        10**9 + 1,
+    ],
+)
+def test_a_log_line_value_that_is_not_a_count_or_a_token_is_withheld(value: object) -> None:
+    # The leak property of `coverage.unread_reason`, held the same way for a log line: a path, a
+    # quote, a credential-shaped string or anything else that is not a bounded token is replaced,
+    # not escaped or truncated. A log line is as readable as a brief.
+    body = json.loads(log_line("scout.entry_dropped", reason=value, index=value))
+    assert body["reason"] == INVALID
+    assert body["index"] == INVALID
+    assert str(value) not in json.dumps(body)
+
+
+def test_a_key_outside_the_fixed_set_never_reaches_a_log_line() -> None:
+    body = json.loads(log_line("scout.done", path="/etc/passwd", quote="secret text", dropped=2))
+    assert set(body) == {"event", "dropped"}
+    assert "/etc/passwd" not in json.dumps(body)
+    assert "secret text" not in json.dumps(body)
+
+
+def test_every_log_call_in_the_scout_emits_one_json_object() -> None:
+    # The emitter being right is not enough: the three call sites have to use it. This drives a run
+    # that logs a drop and a completion, captures the root logger, and parses every line.
+    data = demo_brief()
+    data["findings"] = [
+        *data["findings"],
+        {
+            "title": "Cites a file the sandbox never served",
+            "severity": "medium",
+            "files": ["src/com/harbor/oms/NotThere.java"],
+            "evidence_quote": "this quote is long enough to pass the minimum",
+            "why_it_matters": "it should be dropped and logged",
+        },
+    ]
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    root = logging.getLogger()
+    previous = root.level
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
+    try:
+        result = scout(SAMPLE, Scripted(brief_reply(data)))
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(previous)
+
+    lines = [line for line in stream.getvalue().splitlines() if line.startswith("{")]
+    assert len(lines) >= 2, f"expected a drop line and a done line, got {stream.getvalue()!r}"
+    events = []
+    for line in lines:
+        body = json.loads(line)  # a plain-text log line fails here
+        extra = sorted(set(body) - set(FIELDS))
+        assert not extra, f"key outside the fixed set: {extra}"
+        events.append(body["event"])
+    assert "scout.entry_dropped" in events
+    assert "scout.done" in events
+    assert result.dropped

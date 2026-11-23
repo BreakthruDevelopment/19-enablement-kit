@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 
+from kit.scout.logline import log_line
 from kit.scout.schema import Finding, ScoutBrief
 from kit.scout.secrets import looks_secret
 
@@ -79,8 +80,12 @@ def _check(finding: Finding, served: Mapping[str, str]) -> tuple[Finding | None,
 
 def _drop(dropped: list[Dropped], section: str, index: int, reason: DropReason) -> None:
     dropped.append(Dropped(section, index, reason))
-    # A position and a fixed word. Never the entry: it is the model's text.
-    log.warning("scout.entry_dropped section=%s index=%d reason=%s", section, index, reason.value)
+    # A position and a fixed word. Never the entry: it is the model's text. `log_line` checks
+    # that for us, so a later caller cannot widen this by passing something else.
+    log.warning(
+        "%s",
+        log_line("scout.entry_dropped", section=section, index=index, reason=reason.value),
+    )
 
 
 def verify_brief(

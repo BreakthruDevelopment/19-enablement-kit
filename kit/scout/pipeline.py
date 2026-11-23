@@ -37,6 +37,7 @@ from kit.core.principals import Capability, assert_can
 from kit.core.sandbox import Sandbox
 from kit.scout.errors import ScoutError, ScoutReason
 from kit.scout.explore import Explorer, Step
+from kit.scout.logline import log_line
 from kit.scout.prompt import MAX_OUTPUT_TOKENS, build_prompt
 from kit.scout.schema import Coverage, ScoutBrief, parse_brief
 from kit.scout.secrets import looks_secret
@@ -176,7 +177,7 @@ async def run_scout(
     try:
         response = await provider.converse(request)
     except Exception:  # a throttle, a timeout, an exhausted recording: all "nothing came back"
-        log.warning("scout.provider_error")
+        log.warning("%s", log_line("scout.provider_error"))
         raise ScoutError(ScoutReason.PROVIDER_ERROR) from None
     run_budget.record_turn(response.usage.total)
     if response.stop_reason not in _USABLE_STOPS:
@@ -200,11 +201,14 @@ async def run_scout(
     )
     assert_brief_clean(brief)
     log.info(
-        "scout.done files_read=%d files_total=%d findings=%d dropped=%d",
-        coverage.files_read,
-        coverage.files_total,
-        len(brief.findings),
-        len(dropped),
+        "%s",
+        log_line(
+            "scout.done",
+            files_read=coverage.files_read,
+            files_total=coverage.files_total,
+            findings=len(brief.findings),
+            dropped=len(dropped),
+        ),
     )
     return ScoutResult(
         brief=brief,

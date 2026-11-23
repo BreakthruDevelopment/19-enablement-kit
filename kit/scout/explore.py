@@ -67,8 +67,10 @@ SEED_DESCRIPTORS: Final = ("ejb-jar.xml", "weblogic-ejb-jar.xml")
 UNLISTED: Final = "[unlisted]"
 WITHHELD: Final = "[withheld]"
 
-# A line longer than this is not searched: the patterns are bounded, but a hostile one-line file is
-# a cost the scout has no reason to pay.
+# A line longer than this is not searched. Every `SIGNALS` pattern is linear, so this is not the
+# bound that keeps a hostile one-line file cheap -- `_pieces` in `references` is, and that one is
+# load-bearing. This is a cost the scout has no reason to pay, nothing more. Said plainly because
+# a guard described as a bound is a guard someone later trusts as one.
 MAX_SEARCHED_LINE: Final = 2_000
 MAX_HIT_TEXT: Final = 200
 MAX_REFERENCES_PER_FILE: Final = 200
@@ -435,11 +437,15 @@ class Explorer:
         while self._queue and self._stopped_by is None:
             path, source = self._queue.popleft()
             outcome = self.read(path, why=source)
-            # The decision for the next step is part of this step's record.
-            self._annotate_next()
             if outcome.served and outcome.text is not None:
                 for name in references(path, outcome.text, self._index):
                     self._enqueue(name, f"named by {path}")
+            # The decision for the next step is part of this step's record, and it is only
+            # knowable once this file's own references are in the queue. Annotated before the
+            # enqueue, a read that empties the queue and then discovers something records
+            # `stop:` and is followed by another read, which makes the record -- the slice's
+            # deliverable for statement 5.4 -- contradict the run.
+            self._annotate_next()
         self._annotate_next()
 
     def unread(self) -> dict[str, dict[Kind, int]]:
