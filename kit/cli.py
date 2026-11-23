@@ -36,7 +36,33 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument(
         "--criteria", type=Path, default=Path("criteria"), help="the criteria directory"
     )
+
+    session = commands.add_parser("session", help="list, resume or fork your own sessions")
+    session_commands = session.add_subparsers(dest="session_command", required=True)
+    session_list = session_commands.add_parser("list", help="list your sessions")
+    _add_session_dir(session_list)
+    session_resume = session_commands.add_parser(
+        "resume", help="replay a session's recorded turns, without a model call"
+    )
+    session_resume.add_argument("session_id", metavar="id", help="the session to replay")
+    _add_session_dir(session_resume)
+    session_fork = session_commands.add_parser(
+        "fork", help="copy turns up to a named turn into a new session"
+    )
+    session_fork.add_argument("session_id", metavar="id", help="the session to copy from")
+    session_fork.add_argument("turn", help="copy turns up to and including this turn")
+    _add_session_dir(session_fork)
     return parser
+
+
+def _add_session_dir(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--dir",
+        dest="directory",
+        type=Path,
+        default=Path("sessions"),
+        help="directory of session files (default: sessions/)",
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -59,5 +85,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             replay_dir=args.replay,
             criteria_dir=args.criteria,
         )
+    if command == "session":
+        # Imported here so the other commands do not load the session package.
+        from kit.session.command import (
+            engineer_from_environment,
+            run_fork_command,
+            run_list_command,
+            run_resume_command,
+        )
+
+        principal = engineer_from_environment()
+        if args.session_command == "list":
+            return run_list_command(principal, directory=args.directory)
+        if args.session_command == "resume":
+            return run_resume_command(principal, args.session_id, directory=args.directory)
+        if args.session_command == "fork":
+            return run_fork_command(principal, args.session_id, args.turn, directory=args.directory)
+        return 2
     print(f"kit {__version__}: no command given; see --help", file=sys.stderr)
     return 2

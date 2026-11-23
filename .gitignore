@@ -10,3 +10,5 @@ build/
 .env
 .env.*
 .harness/
+# Recorded sessions are local state, not source.
+sessions/
