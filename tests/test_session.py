@@ -501,13 +501,6 @@ def test_a_symlink_is_not_followed(tmp_path: Path) -> None:
     assert NOTE not in str(caught.value)
 
 
-def test_an_oversized_file_is_refused(tmp_path: Path) -> None:
-    (tmp_path / f"{'d' * 32}.json").write_bytes(b"{" * (MAX_SESSION_BYTES + 1))
-    with pytest.raises(SessionError) as caught:
-        _store(tmp_path).get(DEV, "d" * 32)
-    assert caught.value.reason is SessionReason.INVALID
-
-
 def test_corrupt_session_files_are_refused(tmp_path: Path) -> None:
     store = _store(tmp_path, times=(T0,))
     session = store.create(DEV, _finished())
@@ -787,3 +780,54 @@ def test_a_transcript_bedrock_would_reject_is_not_resumed(
         asyncio.run(resume(store, DEV, session.id))
     assert caught.value.reason is SessionReason.UNSENDABLE
     assert NOTE not in str(caught.value)
+
+
+def test_a_session_grown_past_the_byte_cap_by_append_is_refused_and_stays_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `_write`'s cap is the only bound on a session grown past the cap one turn at a time, and a
+    # read bound cannot stand in for a write one: delete it and the oversized file is written,
+    # after which `get` and `list_sessions` both refuse it for being too big. Every turn already
+    # stored is then lost -- in a store whose contract is that no operation edits or deletes a
+    # turn -- and because the listing reads every file, one over-grown session denies the
+    # engineer the whole of `kit session list`. Turn text is bounded but turn count is not, so a
+    # long run reaches this on its own.
+    #
+    # The cap is patched down so the session grows in a handful of appends instead of rewriting
+    # 8 MiB forty times. All three enforcement points read this one name, so the patch exercises
+    # the real control rather than a copy of it.
+    cap = 64 * 1024
+    monkeypatch.setattr("kit.session.store.MAX_SESSION_BYTES", cap)
+    store = SessionStore(tmp_path, clock=lambda: T0, new_id=lambda: ID_A)
+    session = store.create(DEV, _opening())
+    path = tmp_path / f"{session.id}.json"
+
+    refusal: SessionError | None = None
+    appended = 0
+    for index in range(64):
+        turn = {
+            "name": f"grow{index}",
+            "stop_reason": "tool_use",
+            "text": "x" * 4096,
+            "tool_results": [{"content": "ok", "is_error": False, "tool_use_id": f"u{index}"}],
+            "tool_uses": [{"id": f"u{index}", "input": {}, "name": "note"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        try:
+            store.append(DEV, session.id, turn)
+        except SessionError as err:
+            refusal = err
+            break
+        appended += 1
+    assert refusal is not None, "the cap was never reached: nothing bounds a growing session"
+    assert refusal.reason is SessionReason.INVALID
+    assert appended, "the fixture never appended a turn, so the refusal proves nothing"
+
+    # The refused append left the file as it was: under the cap, readable, and holding exactly
+    # the turns that were accepted.
+    assert path.stat().st_size <= cap
+    kept = store.get(DEV, session.id)
+    assert len(kept.turns) == appended + 1
+    assert kept.turns[0].name == "look"
+    assert [turn.name for turn in kept.turns[1:]] == [f"grow{i}" for i in range(appended)]
+    assert store.list_sessions(DEV) == (kept,)
