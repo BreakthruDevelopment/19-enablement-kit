@@ -57,7 +57,14 @@ from kit.scout import (
     run_scout,
     run_scout_command,
 )
-from kit.scout.explore import ROLLING_SUMMARY_CHARS, SIGNALS, kind_of, references, signal_lines
+from kit.scout.explore import (
+    MAX_REFERENCES_PER_FILE,
+    ROLLING_SUMMARY_CHARS,
+    SIGNALS,
+    kind_of,
+    references,
+    signal_lines,
+)
 from kit.scout.logline import FIELDS, INVALID, log_line
 from kit.scout.pipeline import assert_brief_clean, build_unread_reason
 from kit.scout.prompt import MAX_PROMPT_CHARS, SYSTEM_PROMPT
@@ -962,3 +969,45 @@ def test_every_log_call_in_the_scout_emits_one_json_object() -> None:
     assert "scout.entry_dropped" in events
     assert "scout.done" in events
     assert result.dropped
+
+
+# --- Findings from the Codex review of b7544a8 ---------------------------------------------------
+
+
+def test_a_file_named_only_past_the_reference_cap_is_not_reported_as_unnamed(
+    tmp_path: Path,
+) -> None:
+    # `references` used to apply `MAX_REFERENCES_PER_FILE` itself and return the first 200 names,
+    # so the rest went out with nothing left to count them by. A file one of those names pointed
+    # at was never enqueued, fell through `unread` to `not_referenced`, and `coverage.unread_reason`
+    # then said "Not named by any build file, descriptor or class" about a file the build file
+    # names. Capped exploration and genuinely unreferenced code have to be tellable apart: the
+    # reader's next move is different for each.
+    #
+    # The sample cannot trigger it -- no file there names anything like 200 others -- so this root
+    # is built to sit one name over the cap.
+    root = tmp_path / "wide"
+    (root / "src").mkdir(parents=True)
+    (root / "build.xml").write_text(
+        '<project name="wide"><property name="src" value="src"/></project>\n', encoding="utf-8"
+    )
+    total = MAX_REFERENCES_PER_FILE + 1
+    for number in range(total):
+        (root / "src" / f"A{number:03d}.java").write_text(
+            f"package wide;\npublic class A{number:03d} {{ }}\n", encoding="utf-8"
+        )
+
+    explorer = _explored(root)
+    capped = f"src/A{total - 1:03d}.java"
+    assert capped not in explorer.served, "the fixture must leave the capped name unread"
+    # The seed plus the 200 names it was allowed to follow.
+    assert len(explorer.served) == MAX_REFERENCES_PER_FILE + 1
+
+    assert explorer.unread() == {"not_followed": {"java": 1}}, explorer.unread()
+
+    reason = build_unread_reason(explorer, dropped=(), not_shown=0)
+    assert "Named only past one file's reference cap, so not followed: 1 java." in reason
+    assert "Not named by any build file" not in reason, (
+        "the capped file is named by build.xml; reporting it as unnamed states a false cause: "
+        f"{reason}"
+    )

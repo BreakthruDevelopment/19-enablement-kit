@@ -73,6 +73,9 @@ WITHHELD: Final = "[withheld]"
 # a guard described as a bound is a guard someone later trusts as one.
 MAX_SEARCHED_LINE: Final = 2_000
 MAX_HIT_TEXT: Final = 200
+# How many of one file's references are followed. Applied by `Explorer.explore`, not inside
+# `references`, so the names it drops can be counted and reported as `not_followed`: a file that
+# was named but not followed is not a file nobody named, and `coverage` has to be able to say so.
 MAX_REFERENCES_PER_FILE: Final = 200
 ROLLING_SUMMARY_CHARS: Final = 3_000
 
@@ -237,6 +240,12 @@ def references(path: str, text: str, files: Sequence[str]) -> list[str]:
     `files` is the sandbox's own listing, so this returns only paths the sandbox offered: a name in
     the text that is not in the listing -- `/etc/passwd`, `.env`, `../x` -- matches nothing, and the
     string is dropped here without being kept anywhere. Pure: it opens nothing.
+
+    Every name found is returned; `MAX_REFERENCES_PER_FILE` is the caller's. Capping here would
+    discard names with nothing left to count them by, and the file they pointed at would then be
+    indistinguishable from one no build file, descriptor or class ever named -- a false reason in
+    the one record this slice exists to produce. No bound moves: `wanted` was already built in
+    full before the cap was applied, and the listing bounds it either way.
     """
     kind = kind_of(path)
     wanted: list[str] = []
@@ -278,7 +287,7 @@ def references(path: str, text: str, files: Sequence[str]) -> list[str]:
                     found.append((number, offset + token.start(), by_class(token.group(0))))
     for _, _, names in sorted(found, key=lambda item: item[:2]):
         add(names)
-    return wanted[:MAX_REFERENCES_PER_FILE]
+    return wanted
 
 
 class Explorer:
@@ -298,6 +307,7 @@ class Explorer:
         self._queue: deque[tuple[str, str]] = deque()
         self._queued: set[str] = set()
         self._failed: set[str] = set()
+        self._capped: set[str] = set()
         self._withheld = 0
         self._bytes = 0
         self._stopped_by: ErrorCode | None = None
@@ -438,7 +448,12 @@ class Explorer:
             path, source = self._queue.popleft()
             outcome = self.read(path, why=source)
             if outcome.served and outcome.text is not None:
-                for name in references(path, outcome.text, self._index):
+                named = references(path, outcome.text, self._index)
+                # Past the cap the name is remembered, not followed. If nothing else names it, it
+                # is `not_followed`; `unread` checks `_queued` first, so one that another file
+                # names within its own cap is reached normally and never counted here.
+                self._capped.update(set(named[MAX_REFERENCES_PER_FILE:]) - self._queued)
+                for name in named[:MAX_REFERENCES_PER_FILE]:
                     self._enqueue(name, f"named by {path}")
             # The decision for the next step is part of this step's record, and it is only
             # knowable once this file's own references are in the queue. Annotated before the
@@ -452,6 +467,7 @@ class Explorer:
         """Files not served, grouped by why, then counted by kind. No names: fixed words only."""
         groups: dict[str, Counter[Kind]] = {
             "not_referenced": Counter(),
+            "not_followed": Counter(),
             "not_reached": Counter(),
             "not_readable": Counter(),
         }
@@ -462,6 +478,8 @@ class Explorer:
                 groups["not_readable"][kind_of(path)] += 1
             elif path in self._queued:
                 groups["not_reached"][kind_of(path)] += 1
+            elif path in self._capped:
+                groups["not_followed"][kind_of(path)] += 1
             else:
                 groups["not_referenced"][kind_of(path)] += 1
         return {reason: dict(counts) for reason, counts in groups.items() if counts}

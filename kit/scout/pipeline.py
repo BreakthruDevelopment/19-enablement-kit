@@ -53,6 +53,7 @@ _TRUNCATED: Final = " [truncated]"
 
 _UNREAD_PHRASES: Final = {
     "not_reached": "Not reached before the cap",
+    "not_followed": "Named only past one file's reference cap, so not followed",
     "not_referenced": "Not named by any build file, descriptor or class",
     "not_readable": "Could not be read",
 }
@@ -101,7 +102,7 @@ def build_unread_reason(explorer: Explorer, *, dropped: tuple[Dropped, ...], not
             f"Exploration stopped when the sandbox refused a read with {explorer.stopped_by.value}."
         )
     unread = explorer.unread()
-    for key in ("not_reached", "not_referenced", "not_readable"):
+    for key in ("not_reached", "not_followed", "not_referenced", "not_readable"):
         if key in unread:
             parts.append(f"{_UNREAD_PHRASES[key]}: {_counts(unread[key])}.")
     refusals = explorer.sandbox_refusals()
