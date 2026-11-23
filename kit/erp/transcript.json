@@ -1,0 +1,115 @@
+{
+  "source": "Recorded from a service-role p2p-erp session, company code 1000. The kit does not import app 18; this file is the replay.",
+  "protocolVersion": "2025-03-26",
+  "serverInfo": {
+    "name": "p2p-erp",
+    "version": "0.1.0"
+  },
+  "tools": [
+    {
+      "name": "find_supplier",
+      "description": "Find suppliers in the caller's company code whose name contains the given text. Results are capped and paged. count is the size of this page, not a total; a count equal to limit means another page may exist.",
+      "readOnlyHint": true
+    },
+    {
+      "name": "get_purchase_order",
+      "description": "Read one purchase order in the caller's company code, including its lines. Amounts are integer minor currency units.",
+      "readOnlyHint": true
+    },
+    {
+      "name": "get_goods_receipt",
+      "description": "Read the goods receipts for one purchase order in the caller's company code. Pass line_no for a single line. Results are capped and paged.",
+      "readOnlyHint": true
+    },
+    {
+      "name": "get_invoice",
+      "description": "Read one invoice in the caller's company code, including its lines. Amounts are integer minor currency units.",
+      "readOnlyHint": true
+    },
+    {
+      "name": "list_open_invoices",
+      "description": "List invoices in the caller's company code that are not posted or held. Results are capped and paged. count is the size of this page, not a total.",
+      "readOnlyHint": true
+    },
+    {
+      "name": "get_payment_status",
+      "description": "Read an invoice's state and what has been applied to it: the applied posting, applied holds, and the applied credit total in the invoice's currency. A staged change that nobody has applied yet is not included.",
+      "readOnlyHint": true
+    }
+  ],
+  "calls": [
+    {
+      "name": "get_invoice",
+      "arguments": {
+        "invoice_id": "INV-1001"
+      },
+      "isError": false,
+      "structuredContent": {
+        "company_code": "1000",
+        "currency": "USD",
+        "date": "2026-11-08",
+        "id": "INV-1001",
+        "lines": [
+          {
+            "description": "M8 hex bolts, zinc",
+            "line_no": 1,
+            "qty": 100,
+            "tax": 0,
+            "unit_price": 1250
+          }
+        ],
+        "number": "1001-A",
+        "po_ref": "PO-1001",
+        "state": "received",
+        "supplier_id": "SUP-1001",
+        "total": 125000
+      }
+    },
+    {
+      "name": "get_invoice",
+      "arguments": {
+        "invoice_id": "INV-2001"
+      },
+      "isError": true,
+      "structuredContent": {
+        "error_category": "permission",
+        "is_retryable": false,
+        "message": "no invoice visible to this principal"
+      }
+    },
+    {
+      "name": "list_open_invoices",
+      "arguments": {
+        "limit": 1
+      },
+      "isError": false,
+      "structuredContent": {
+        "count": 1,
+        "items": [
+          {
+            "company_code": "1000",
+            "currency": "USD",
+            "date": "2026-11-08",
+            "id": "INV-1001",
+            "lines": [
+              {
+                "description": "M8 hex bolts, zinc",
+                "line_no": 1,
+                "qty": 100,
+                "tax": 0,
+                "unit_price": 1250
+              }
+            ],
+            "number": "1001-A",
+            "po_ref": "PO-1001",
+            "state": "received",
+            "supplier_id": "SUP-1001",
+            "total": 125000
+          }
+        ],
+        "limit": 1,
+        "offset": 0
+      }
+    }
+  ]
+}

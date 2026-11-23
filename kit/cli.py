@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import cast
 
 from kit import __version__
+from kit.erp.command import register_erp, run_erp_command
 from kit.scaffold.command import register_new, run_new
 
 
@@ -20,6 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", metavar="<command>")
 
     register_new(commands)
+    register_erp(commands)
 
     review = commands.add_parser(
         "review", help="run the review passes over a diff, against the written criteria"
@@ -45,6 +47,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if command == "new":
         return run_new(args)
+    if command == "erp":
+        return run_erp_command(args)
     if command == "review":
         # Imported here so `kit --version` and `kit new` do not load the review package.
         from kit.review.command import engineer_from_environment, run_review_command
