@@ -28,6 +28,10 @@ claim. Where JavaScript (the gate) and Python (here) differ:
   JavaScript does not, and `re.I` folds a few non-ASCII letters JavaScript does not. The kit refuses
   a few bodies the gate would read as safe, which is fine.
 
+`Verdict:` is refused with the same pattern as `Reviewer:`. The gate reads `Verdict` only from a
+review it found by `Reviewer`, so a lone `Verdict: ready` is not a sign-off on its own; refusing it
+anyway costs the report nothing and keeps the kit from depending on that pairing.
+
 `codex-review-state:v1` is refused as well: on the Codex-gated slices it is a second string that
 satisfies sign-off, through a different function in the gate, and it is not anchored to a line
 start, so it is refused wherever it appears.
@@ -52,19 +56,38 @@ from typing import Final
 
 from kit.review.errors import ReviewError, ReviewReason
 
-__all__ = ["assert_body_safe", "normalise_terminators", "reads_as_signoff"]
+__all__ = ["assert_body_safe", "defang_codex_state", "normalise_terminators", "reads_as_signoff"]
 
 # \r\n first, so a CRLF becomes one terminator and not two.
 _TERMINATORS: Final = re.compile(r"\r\n|[\r\u2028\u2029]")
 
 _WS: Final = r"[\s\ufeff]"
 
+# Both keys the gate reads. It finds a review by `Reviewer` and then reads `Verdict` from the same
+# body, so a line that forges either one is refused: the kit's report has no reason to carry either,
+# and "refuse both" is the only reading that does not depend on how the gate pairs them.
 _GATE: Final = re.compile(
-    rf"^{_WS}*\**Reviewer\**{_WS}*:{_WS}*\**{_WS}*([a-z-]+)",
+    rf"^{_WS}*\**(?:Reviewer|Verdict)\**{_WS}*:{_WS}*\**{_WS}*([a-z-]+)",
     re.MULTILINE | re.IGNORECASE,
 )
 
 _CODEX_STATE: Final = re.compile(rf"codex-review-state{_WS}*:", re.IGNORECASE)
+
+
+_CODEX_STATE_KEY: Final = re.compile(rf"(codex-review-state)(?={_WS}*:)", re.IGNORECASE)
+
+# U+200B is neither whitespace to the gate's `\\s` nor to Python's, so it ends the key for both.
+_ZERO_WIDTH_SPACE: Final = "\u200b"
+
+
+def defang_codex_state(body: str) -> str:
+    """Break up `codex-review-state` where it is followed by a colon, so it cannot be read as one.
+
+    Unlike `Reviewer:` it is not anchored to a line start, so the `> ` that quotes evidence does
+    nothing for it, and refusing the report outright would let any diff containing the string
+    silence the kit's whole review. The text stays readable; it just stops being the key.
+    """
+    return _CODEX_STATE_KEY.sub(rf"\1{_ZERO_WIDTH_SPACE}", body)
 
 
 def normalise_terminators(body: str) -> str:

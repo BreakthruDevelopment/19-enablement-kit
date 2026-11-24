@@ -1,0 +1,13 @@
+{
+  "description": "Recorded project-rules pass for the default CI run: no findings, whatever the diff.",
+  "replies": [
+    {
+      "stop_reason": "end_turn",
+      "text": "{\"findings\": [], \"passes_run\": [\"project-rules\"]}",
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0
+      }
+    }
+  ]
+}

@@ -15,18 +15,39 @@ the whole report if the gate could read any of it as a sign-off.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
+from enum import StrEnum
 from typing import Final
 
+from kit.review.errors import ReviewError, ReviewReason
 from kit.review.passes import PassStatus, RecordedFinding
 from kit.review.passes_names import PassName
 from kit.review.pipeline import PresentedFinding, ReviewResult
-from kit.review.sanitize import assert_body_safe, normalise_terminators
+from kit.review.sanitize import assert_body_safe, defang_codex_state, normalise_terminators
 
-__all__ = ["render_report"]
+__all__ = ["EXTRA_MARKER_KEYS", "ReportMode", "render_report"]
 
 _MARKER: Final = "Kit-Review: pr-review"
 _BLOCKING_MARKER: Final = "Kit-Verdict: blocking"
 _MAX_QUOTE_LINES: Final = 8
+
+# The only extra marker lines a caller can add, and the shape their values must have. A fixed set of
+# keys and a token-shaped value: nothing a diff or a model wrote can reach a marker line.
+EXTRA_MARKER_KEYS: Final = frozenset({"Kit-Mode", "Kit-Commit"})
+_MARKER_VALUE: Final = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+class ReportMode(StrEnum):
+    """How the passes got their answers. Said in the report, because it changes what it proves."""
+
+    RECORDED = "recorded"
+    LIVE = "live"
+
+
+_RECORDED_NOTICE: Final = (
+    "This run used recorded replies: no model read this diff. The lines below show that the"
+    " pipeline ran, not that the change is clean."
+)
 
 _SQUASH = re.compile(r"[\s\ufeff\x00-\x1f\x7f]+")
 
@@ -76,7 +97,12 @@ def _item(item: PresentedFinding) -> list[str]:
     return out
 
 
-def render_report(result: ReviewResult) -> str:
+def render_report(
+    result: ReviewResult,
+    *,
+    mode: ReportMode | None = None,
+    markers: Mapping[str, str] | None = None,
+) -> str:
     """The body to post. Raises `ReviewError` if the body could satisfy the gate, and `ValueError`
     if the run is incomplete: an incomplete run has no report."""
     if not result.complete:
@@ -84,11 +110,18 @@ def render_report(result: ReviewResult) -> str:
     lines = [_MARKER]
     if result.blocking:
         lines.append(_BLOCKING_MARKER)
+    for key, value in (markers or {}).items():
+        if key not in EXTRA_MARKER_KEYS or not _MARKER_VALUE.fullmatch(value):
+            raise ReviewError(ReviewReason.CI_INPUT_INVALID)
+        lines.append(f"{key}: {value}")
     lines += ["", "## Automated review", ""]
     lines.append(
         "This is an automated report. It can block, it cannot approve, and it is not a sign-off:"
         " the merge gate's approval stays with a person."
     )
+    if mode is ReportMode.RECORDED:
+        lines.append("")
+        lines.append(_RECORDED_NOTICE)
     lines.append("")
     for p in result.passes:
         if p.name is PassName.CONSOLIDATION:
@@ -128,6 +161,7 @@ def render_report(result: ReviewResult) -> str:
         if unshown > 0:
             lines.append("")
             lines.append(f"{unshown} further finding(s) are on record and not shown here.")
-    body = "\n".join(lines) + "\n"
+    # Defanged first, then checked: the check is the control, and it still refuses anything left.
+    body = defang_codex_state("\n".join(lines) + "\n")
     assert_body_safe(body)
     return body
