@@ -11,6 +11,8 @@ from typing import cast
 from kit import __version__
 from kit.erp.command import register_erp, run_erp_command
 from kit.scaffold.command import register_new, run_new
+from kit.scout.command import engineer_from_environment as scout_principal
+from kit.scout.command import register_scout, run_scout_command
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -22,6 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     register_new(commands)
     register_erp(commands)
+    register_scout(commands)
 
     review = commands.add_parser(
         "review", help="run the review passes over a diff, against the written criteria"
@@ -75,6 +78,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_new(args)
     if command == "erp":
         return run_erp_command(args)
+    if command == "scout":
+        return run_scout_command(args.root, principal=scout_principal(), replay_dir=args.replay)
     if command == "review":
         # Imported here so `kit --version` and `kit new` do not load the review package.
         from kit.review.command import engineer_from_environment, run_review_command
