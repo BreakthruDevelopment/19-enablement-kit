@@ -10,6 +10,7 @@ from typing import cast
 
 from kit import __version__
 from kit.erp.command import register_erp, run_erp_command
+from kit.plan.command import register_plan
 from kit.scaffold.command import register_new, run_new
 from kit.scout.command import engineer_from_environment as scout_principal
 from kit.scout.command import register_scout, run_scout_command
@@ -25,6 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_new(commands)
     register_erp(commands)
     register_scout(commands)
+    register_plan(commands)
 
     review = commands.add_parser(
         "review", help="run the review passes over a diff, against the written criteria"
@@ -107,5 +109,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.session_command == "fork":
             return run_fork_command(principal, args.session_id, args.turn, directory=args.directory)
         return 2
+    if command == "plan":
+        # Imported here so the other commands do not load the plan package and the agent loop.
+        from kit.plan.command import engineer_from_environment as plan_principal
+        from kit.plan.command import run_plan_command
+
+        return run_plan_command(
+            args.task,
+            principal=plan_principal(),
+            replay_dir=args.replay,
+            directory=args.directory,
+            criteria_dir=args.criteria,
+            refine=args.refine,
+        )
     print(f"kit {__version__}: no command given; see --help", file=sys.stderr)
     return 2

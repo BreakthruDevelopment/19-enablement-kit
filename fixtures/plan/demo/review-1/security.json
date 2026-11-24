@@ -1,0 +1,13 @@
+{
+ "description": "Recorded security pass over the direct arm's patch (round 1 of the refinement demo).",
+ "replies": [
+  {
+   "stop_reason": "end_turn",
+   "text": "{\n \"findings\": [\n  {\n   \"path\": \"src/com/harbor/oms/dao/OrderDao.java\",\n   \"line\": 287,\n   \"category\": \"security\",\n   \"claim\": \"statusCode is still concatenated into the SQL text, so the query is still built from input; only customerId was bound.\",\n   \"evidence_quote\": \"+ \\\"AND status_code = '\\\" + statusCode + \\\"' \\\"\",\n   \"criterion_id\": \"SEC-1\"\n  }\n ],\n \"passes_run\": [\n  \"security\"\n ]\n}",
+   "usage": {
+    "input_tokens": 2200,
+    "output_tokens": 150
+   }
+  }
+ ]
+}

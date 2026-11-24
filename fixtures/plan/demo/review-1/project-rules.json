@@ -1,0 +1,13 @@
+{
+ "description": "Recorded project-rules pass over the direct arm's patch (round 1 of the refinement demo).",
+ "replies": [
+  {
+   "stop_reason": "end_turn",
+   "text": "{\n \"findings\": [\n  {\n   \"path\": \"src/com/harbor/oms/dao/OrderDao.java\",\n   \"line\": 287,\n   \"category\": \"project-rules\",\n   \"claim\": \"The statement is prepared but one value is still concatenated instead of bound.\",\n   \"evidence_quote\": \"+ \\\"AND status_code = '\\\" + statusCode + \\\"' \\\"\",\n   \"criterion_id\": \"RUL-2\"\n  }\n ],\n \"passes_run\": [\n  \"project-rules\"\n ]\n}",
+   "usage": {
+    "input_tokens": 2400,
+    "output_tokens": 140
+   }
+  }
+ ]
+}

@@ -1,0 +1,13 @@
+{
+ "description": "Recorded security pass over the second attempt's patch (round 2 of the refinement demo).",
+ "replies": [
+  {
+   "stop_reason": "end_turn",
+   "text": "{\n \"findings\": [],\n \"passes_run\": [\n  \"security\"\n ]\n}",
+   "usage": {
+    "input_tokens": 2400,
+    "output_tokens": 40
+   }
+  }
+ ]
+}
