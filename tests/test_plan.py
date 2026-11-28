@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from kit.cli import main
 from kit.core.errors import KitError
@@ -381,7 +382,7 @@ def test_a_nul_in_the_recorded_system_prompt_is_refused_before_anything_is_writt
     assert "\x00" not in err
 
 
-def test_the_opening_refuses_text_turn_rejects_without_quoting_it() -> None:
+def test_the_opening_refuses_text_that_turn_rejects_without_quoting_it() -> None:
     """`_opening()`'s own guard, pinned, and its refusal checked for a leak.
 
     The load-time screen makes this unreachable through `kit plan` today, so without a direct test
@@ -399,7 +400,10 @@ def test_the_opening_refuses_text_turn_rejects_without_quoting_it() -> None:
             nonce="abcd1234",
         )
     assert refused.value.reason is PlanReason.RECORDING_INVALID
-    message = str(refused.value) + getattr(refused.value, "message", "")
+    # `PlanError` interpolates nothing, so this is a guard on that staying true, not the
+    # discriminator: a leaking `_opening()` raises `ValidationError` and fails `pytest.raises`
+    # above. `str()` is the whole message -- `PlanError` has no `.message`, unlike `KitError`.
+    message = str(refused.value)
     assert canary not in message
     assert "\x00" not in message
 
@@ -485,6 +489,33 @@ def _with_plan_text(text: str) -> PlanRecording:
     data = json.loads((DEMO / "plan.json").read_text("utf-8"))
     _first_use(data["planned"][1])["input"]["plan"] = text
     return PlanRecording.model_validate(data)
+
+
+@pytest.mark.parametrize("field", ["task", "system"])
+def test_the_plan_recording_refuses_a_nul_in_its_opening_text(field: str) -> None:
+    """The load-time screen on `PlanRecording`, pinned directly.
+
+    It has to be pinned here rather than through `kit plan`, because `_opening()` refuses the same
+    input with the same code one step later: nothing observable distinguishes the two layers, so a
+    command-level test passes with this screen deleted. The point of screening at load is that the
+    refusal happens before a root is read or a session is created, and that it is a fixed code
+    rather than a pydantic message carrying the recording's own text.
+    """
+    data = json.loads((DEMO / "plan.json").read_text("utf-8"))
+    PlanRecording.model_validate(data)  # the committed recording is clean
+    data[field] = data[field] + "\x00"
+    with pytest.raises(ValidationError):
+        PlanRecording.model_validate(data)
+
+
+@pytest.mark.parametrize("field", ["system", "user_message"])
+def test_the_refinement_recording_refuses_a_nul_in_its_opening_text(field: str) -> None:
+    """The same screen on `RefineRecording`, pinned the same way and for the same reason."""
+    data = json.loads((DEMO / "refine.json").read_text("utf-8"))
+    RefineRecording.model_validate(data)
+    data[field] = data[field] + "\x00"
+    with pytest.raises(ValidationError):
+        RefineRecording.model_validate(data)
 
 
 def test_a_plan_is_accepted_at_the_cap_and_refused_one_character_over() -> None:
