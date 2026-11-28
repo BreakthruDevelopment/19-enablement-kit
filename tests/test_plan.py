@@ -396,11 +396,11 @@ def _with_plan_text(text: str) -> PlanRecording:
 
 def test_a_plan_is_accepted_at_the_cap_and_refused_one_character_over() -> None:
     # The literals are the point: spelled with `MAX_PLAN_CHARS`, raising the cap moves the test.
-    assert MAX_PLAN_CHARS == 4_000
     check_plan_rules(_with_plan_text("p" * 4_000))
     with pytest.raises(PlanError) as refusal:
         check_plan_rules(_with_plan_text("p" * 4_001))
     assert refusal.value.reason is PlanReason.PLAN_MODE_VIOLATED
+    assert MAX_PLAN_CHARS == 4_000
 
 
 def test_the_plan_rules_accept_the_committed_recording() -> None:
