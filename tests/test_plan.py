@@ -34,7 +34,7 @@ from kit.plan.recording import (
     patch_stats,
     staged_patches,
 )
-from kit.plan.run import build_refine_opening, run_plan
+from kit.plan.run import _opening, build_refine_opening, run_plan
 from kit.review.criteria import load_criteria
 from kit.review.inputs import MAX_DIFF_FILES
 from kit.review.pipeline import run_review
@@ -373,11 +373,35 @@ def test_a_nul_in_the_recorded_system_prompt_is_refused_before_anything_is_writt
     code, lines, err = _run(tmp_path, replay=demo)
     assert code == 2
     assert lines == []
-    assert PlanReason.RECORDING_INVALID.value in err
+    # First, because this is the one the fix is for: the pre-fix run wrote a file and then failed.
     assert _sessions(tmp_path) == [], "a session file was written before the NUL was refused"
-    # The store is still readable: no orphan left behind to break `kit session list`.
+    # And the store is still readable: no orphan left behind to break `kit session list`.
     assert SessionStore(tmp_path / "sessions").list_sessions(DEV) == ()
+    assert PlanReason.RECORDING_INVALID.value in err
     assert "\x00" not in err
+
+
+def test_the_opening_refuses_text_turn_rejects_without_quoting_it() -> None:
+    """`_opening()`'s own guard, pinned, and its refusal checked for a leak.
+
+    The load-time screen makes this unreachable through `kit plan` today, so without a direct test
+    the guard could be removed or reverted to `model_copy(update=...)` with nothing failing. It
+    also has to translate pydantic's `ValidationError`: pydantic puts the offending value in its
+    message and `run_plan_command` catches only the kit's own error types, so an escaping one
+    would print a slice of the recording -- the leak this guard exists to prevent.
+    """
+    canary = "CANARY-7f3a-leak"
+    with pytest.raises(PlanError) as refused:
+        _opening(
+            _recording().prefix[0],
+            user_message="ok",
+            system=canary + "\x00",
+            nonce="abcd1234",
+        )
+    assert refused.value.reason is PlanReason.RECORDING_INVALID
+    message = str(refused.value) + getattr(refused.value, "message", "")
+    assert canary not in message
+    assert "\x00" not in message
 
 
 def test_a_nul_in_the_refinement_recording_is_refused_the_same_way(tmp_path: Path) -> None:
