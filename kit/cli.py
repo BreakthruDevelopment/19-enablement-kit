@@ -42,6 +42,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--criteria", type=Path, default=Path("criteria"), help="the criteria directory"
     )
 
+    review_ci = commands.add_parser(
+        "review-ci",
+        help="the headless reviewer: run the passes as `ci` and post at most one review",
+    )
+    review_ci.add_argument("diff", type=Path, help="the pull request's unified diff file")
+    review_ci.add_argument("--repo", required=True, help="owner/name of the repository")
+    review_ci.add_argument("--pr", required=True, type=int, help="the pull request number")
+    review_ci.add_argument("--commit", required=True, help="the head commit the diff ends at")
+    review_ci.add_argument(
+        "--live", action="store_true", help="call the model; default is recorded replies"
+    )
+    review_ci.add_argument(
+        "--replay", type=Path, default=None, help="directory of per-pass recorded replies"
+    )
+    review_ci.add_argument(
+        "--criteria", type=Path, default=Path("criteria"), help="the criteria directory"
+    )
+
     session = commands.add_parser("session", help="list, resume or fork your own sessions")
     session_commands = session.add_subparsers(dest="session_command", required=True)
     session_list = session_commands.add_parser("list", help="list your sessions")
@@ -89,6 +107,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_review_command(
             args.diff,
             principal=engineer_from_environment(),
+            replay_dir=args.replay,
+            criteria_dir=args.criteria,
+        )
+    if command == "review-ci":
+        from kit.review.ci import run_ci_review
+
+        return run_ci_review(
+            args.diff,
+            repo=args.repo,
+            pr=args.pr,
+            commit=args.commit,
+            live=args.live,
             replay_dir=args.replay,
             criteria_dir=args.criteria,
         )
