@@ -18,12 +18,14 @@ from typing import Any
 import pytest
 
 from kit.cli import main
+from kit.core.errors import KitError
 from kit.core.principals import Principal
 from kit.core.sandbox import Sandbox
 from kit.plan.command import run_plan_command
 from kit.plan.errors import PlanError, PlanReason
 from kit.plan.recording import (
     EXIT_PLAN_MODE,
+    MAX_PLAN_CHARS,
     PROPOSE_PATCH,
     READ_TOOLS,
     PlanRecording,
@@ -32,8 +34,9 @@ from kit.plan.recording import (
     patch_stats,
     staged_patches,
 )
-from kit.plan.run import build_refine_opening
+from kit.plan.run import build_refine_opening, run_plan
 from kit.review.criteria import load_criteria
+from kit.review.inputs import MAX_DIFF_FILES
 from kit.review.pipeline import run_review
 from kit.review.replay import ReplayDirectory
 from kit.session import SessionStore, resume
@@ -189,6 +192,40 @@ def test_ci_may_not_plan_and_nothing_is_read_or_stored(tmp_path: Path) -> None:
     assert _sessions(tmp_path) == []
 
 
+def test_ci_is_refused_before_the_replay_directory_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The session store would refuse `ci` anyway, further down; that is why the refusal alone
+    # cannot show that `Capability.RUN_PLAN` is checked. What it cannot do is un-read the files.
+    reads: list[Path] = []
+    original = Sandbox.read_text
+
+    def spy(self: Sandbox, path: Path, *args: Any, **kwargs: Any) -> str:
+        reads.append(path)
+        return original(self, path, *args, **kwargs)
+
+    monkeypatch.setattr(Sandbox, "read_text", spy)
+    for refine in (False, True):
+        code, lines, err = _run(tmp_path, principal=Principal.ci(), refine=refine)
+        assert code == 2
+        assert lines == []
+        assert "principal.forbidden" in err
+    assert reads == []
+
+
+def test_run_plan_itself_refuses_ci_before_looking_at_the_task_or_the_recording(
+    tmp_path: Path,
+) -> None:
+    # The command checks the capability first, so only a direct call reaches `run_plan`'s own check.
+    # A task with no recording would otherwise be refused as a PlanError, and a valid one by the
+    # session store: the capability's refusal is the only one that is a KitError for this task.
+    store = SessionStore(tmp_path / "sessions")
+    with pytest.raises(KitError) as refusal:
+        asyncio.run(run_plan(store, Principal.ci(), _recording(), "a task with no recording"))
+    assert refusal.value.code.value == "principal.forbidden"
+    assert _sessions(tmp_path) == []
+
+
 def test_lead_may_plan(tmp_path: Path) -> None:
     code, _, err = _run(tmp_path, principal=Principal.lead("lead"))
     assert code == 0, err
@@ -311,6 +348,59 @@ def test_a_recording_that_breaks_the_plan_rules_is_refused_before_anything_is_st
     assert reason.value in err
     assert lines == []
     assert _sessions(tmp_path) == []
+
+
+def _staged_diff(data: dict[str, Any]) -> str:
+    diff: str = _first_use(data["direct"][0])["input"]["diff"]
+    return diff
+
+
+def test_a_staged_patch_with_a_nul_byte_is_refused(tmp_path: Path) -> None:
+    # It starts with `diff --git`, so only the review's own diff check can refuse it.
+    demo = _copy_demo(tmp_path)
+
+    def poison(data: dict[str, Any]) -> None:
+        diff = _staged_diff(data)
+        assert diff.startswith("diff --git ")
+        _first_use(data["direct"][0])["input"].update(diff=diff + "+x\0y\n")
+
+    _edit(demo / "plan.json", poison)
+    code, lines, err = _run(tmp_path, replay=demo)
+    assert code == 2, err
+    assert PlanReason.BAD_PATCH.value in err
+    assert lines == []
+    assert _sessions(tmp_path) == []
+
+
+def test_a_staged_patch_touching_too_many_files_is_refused(tmp_path: Path) -> None:
+    # The 200 KB byte cap is not reachable here: a recorded tool input is capped at 64 KiB by the
+    # session `Turn`, which refuses the file as `recording_invalid` first. The file cap is.
+    demo = _copy_demo(tmp_path)
+
+    def grow(data: dict[str, Any]) -> None:
+        use = _first_use(data["direct"][0])
+        use["input"]["diff"] += "+++ b/f\n" * (MAX_DIFF_FILES + 1)
+
+    _edit(demo / "plan.json", grow)
+    code, _, err = _run(tmp_path, replay=demo)
+    assert code == 2, err
+    assert PlanReason.BAD_PATCH.value in err
+    assert _sessions(tmp_path) == []
+
+
+def _with_plan_text(text: str) -> PlanRecording:
+    data = json.loads((DEMO / "plan.json").read_text("utf-8"))
+    _first_use(data["planned"][1])["input"]["plan"] = text
+    return PlanRecording.model_validate(data)
+
+
+def test_a_plan_is_accepted_at_the_cap_and_refused_one_character_over() -> None:
+    # The literals are the point: spelled with `MAX_PLAN_CHARS`, raising the cap moves the test.
+    check_plan_rules(_with_plan_text("p" * 4_000))
+    with pytest.raises(PlanError) as refusal:
+        check_plan_rules(_with_plan_text("p" * 4_001))
+    assert refusal.value.reason is PlanReason.PLAN_MODE_VIOLATED
+    assert MAX_PLAN_CHARS == 4_000
 
 
 def test_the_plan_rules_accept_the_committed_recording() -> None:
@@ -447,6 +537,39 @@ def test_refine_reviews_the_direct_attempt_and_reports_what_changed(tmp_path: Pa
     assert change["new"] == []
     assert change["verdict"] == {"round_1": "blocking", "round_2": None}
     assert len(_sessions(tmp_path)) == 4
+
+
+def test_a_finding_the_second_round_raises_afresh_is_reported_as_new(tmp_path: Path) -> None:
+    # In the committed demo round 2 raises a subset of round 1, so `new` is empty by construction.
+    # Here round 2's correctness pass raises COR-1 on the same file, which round 1 never raised.
+    demo = _copy_demo(tmp_path)
+
+    def raise_afresh(data: dict[str, Any]) -> None:
+        body = json.loads(data["replies"][0]["text"])
+        body["findings"] = [
+            {
+                "path": "src/com/harbor/oms/dao/OrderDao.java",
+                "line": 291,
+                "category": "correctness",
+                "claim": "The status filter is bound by position, and nothing checks the order.",
+                "evidence_quote": "statement.setString(2, statusCode);",
+                "criterion_id": "COR-1",
+            }
+        ]
+        data["replies"][0]["text"] = json.dumps(body)
+
+    _edit(demo / "review-2" / "correctness.json", raise_afresh)
+    _edit(
+        demo / "review-2" / "consolidation.json",
+        lambda d: d["replies"][0].update(text=json.dumps({"groups": [{"members": [0]}]})),
+    )
+    code, lines, err = _run(tmp_path, replay=demo, refine=True)
+    assert code == 0, err
+    second, change = lines[-2:]
+    assert {f["criterion_id"] for f in second["findings"]} == {"TST-1", "COR-1"}
+    assert [f["criterion_id"] for f in change["new"]] == ["COR-1"]
+    assert [f["criterion_id"] for f in change["persisting"]] == ["TST-1"]
+    assert {f["criterion_id"] for f in change["resolved"]} == {"SEC-1", "RUL-2"}
 
 
 def test_the_second_attempt_opens_with_the_findings_fenced_as_data(tmp_path: Path) -> None:
