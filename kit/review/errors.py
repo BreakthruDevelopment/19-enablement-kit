@@ -24,6 +24,10 @@ class ReviewReason(StrEnum):
     CRITERIA_INVALID = "review.criteria_invalid"
     REPLAY_MISSING = "review.replay_missing"
     REPORT_REFUSED = "review.report_refused"
+    CI_INPUT_INVALID = "review.ci_input_invalid"
+    LIVE_UNCONFIGURED = "review.live_unconfigured"
+    POST_FAILED = "review.post_failed"
+    POST_UNVERIFIABLE = "review.post_unverifiable"
 
 
 _MESSAGE = {
@@ -35,6 +39,12 @@ _MESSAGE = {
     ReviewReason.REPLAY_MISSING: "no recorded replies exist for a pass",
     ReviewReason.REPORT_REFUSED: (
         "the assembled report would satisfy the factory's sign-off check, so it was not posted"
+    ),
+    ReviewReason.CI_INPUT_INVALID: "a repository, pull request or commit argument is not valid",
+    ReviewReason.LIVE_UNCONFIGURED: "a live run needs a model id in the environment",
+    ReviewReason.POST_FAILED: "the review could not be posted to the pull request",
+    ReviewReason.POST_UNVERIFIABLE: (
+        "the pull request's existing reviews could not be read, so at-most-one cannot be checked"
     ),
 }
 

@@ -14,8 +14,9 @@ Exit codes, so a workflow step can tell the four outcomes apart:
   no recording.
 * `3` -- the assembled report could satisfy the factory's sign-off check, so it was withheld.
 
-Only recorded replies are wired in this slice. `--replay` names a directory of per-pass recordings,
-defaulting to `replies/` beside the diff, so every run is at zero cost with no network.
+`kit review` itself uses recorded replies only: `--replay` names a directory of per-pass recordings,
+defaulting to `replies/` beside the diff, so every run is at zero cost with no network. The headless
+CI command (`kit.review.ci`) passes `providers` for a live run.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ import asyncio
 import os
 import re
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Final, TextIO
 
@@ -34,9 +36,9 @@ from kit.core.sandbox import Sandbox
 from kit.review.criteria import BLOCKING_SEVERITIES, load_criteria
 from kit.review.errors import ReviewError
 from kit.review.inputs import MAX_DIFF_BYTES
-from kit.review.pipeline import run_review
+from kit.review.pipeline import ProviderSource, run_review
 from kit.review.replay import ReplayDirectory
-from kit.review.report import render_report
+from kit.review.report import ReportMode, render_report
 
 __all__ = ["engineer_from_environment", "run_review_command"]
 
@@ -59,6 +61,9 @@ def run_review_command(
     criteria_dir: Path = DEFAULT_CRITERIA_DIR,
     out: TextIO | None = None,
     err: TextIO | None = None,
+    providers: ProviderSource | None = None,
+    mode: ReportMode | None = None,
+    markers: Mapping[str, str] | None = None,
 ) -> int:
     out = out if out is not None else sys.stdout
     err = err if err is not None else sys.stderr
@@ -72,10 +77,14 @@ def run_review_command(
         )
         diff = sandbox.read_text(diff_file)
         criteria = load_criteria(sandbox, criteria_dir.resolve())
-        replies = ReplayDirectory(
-            replay_dir if replay_dir is not None else diff_file.parent / "replies"
+        source: ProviderSource = (
+            providers
+            if providers is not None
+            else ReplayDirectory(
+                replay_dir if replay_dir is not None else diff_file.parent / "replies"
+            )
         )
-        result = asyncio.run(run_review(diff, replies, criteria))
+        result = asyncio.run(run_review(diff, source, criteria))
     except KitError as refusal:
         print(f"kit review: {refusal.message}", file=err)
         return 2
@@ -106,7 +115,7 @@ def run_review_command(
             )
         return 1
     try:
-        body = render_report(result)
+        body = render_report(result, mode=mode, markers=markers)
     except ReviewError as refusal:
         print(f"kit review: {refusal}", file=err)
         return 3
