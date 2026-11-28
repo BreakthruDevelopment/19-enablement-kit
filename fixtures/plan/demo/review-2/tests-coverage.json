@@ -1,0 +1,13 @@
+{
+ "description": "Recorded tests-coverage pass over the second attempt's patch (round 2 of the refinement demo).",
+ "replies": [
+  {
+   "stop_reason": "end_turn",
+   "text": "{\n \"findings\": [\n  {\n   \"path\": \"src/com/harbor/oms/dao/OrderDao.java\",\n   \"line\": 291,\n   \"category\": \"tests\",\n   \"claim\": \"The changed query has no test in the diff that binds a customer and a status and checks the rows returned.\",\n   \"evidence_quote\": \"statement.setString(2, statusCode);\",\n   \"criterion_id\": \"TST-1\"\n  }\n ],\n \"passes_run\": [\n  \"tests-coverage\"\n ]\n}",
+   "usage": {
+    "input_tokens": 2800,
+    "output_tokens": 120
+   }
+  }
+ ]
+}
