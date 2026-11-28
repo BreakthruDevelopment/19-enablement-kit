@@ -521,9 +521,10 @@ def test_a_finding_only_the_second_round_raises_is_reported_as_new(tmp_path: Pat
     """The `new` bucket, pinned.
 
     The demo's second round resolves two findings and keeps one, so `new` is empty and
-    `test_refine_reports_what_changed_between_the_rounds` asserts `change["new"] == []` -- which
-    passes just as well if `changes()` hardcodes it. Here round 2's security pass raises a
-    criterion round 1 did not, which has to show up as new and has to move round 2's verdict.
+    `test_refine_reviews_the_direct_attempt_and_reports_what_changed` asserts
+    `change["new"] == []` -- which passes just as well if `changes()` hardcodes it. Here round 2's
+    security pass raises a criterion round 1 did not, which has to show up as new and has to move
+    round 2's verdict.
     """
     demo = _copy_demo(tmp_path)
 
@@ -598,6 +599,29 @@ def test_a_plan_longer_than_the_cap_is_refused(tmp_path: Path) -> None:
     assert lines == []
     assert PlanReason.PLAN_MODE_VIOLATED.value in err
     assert _sessions(tmp_path) == []
+
+
+def test_a_nul_in_a_recorded_system_prompt_is_refused_before_anything_is_written(
+    tmp_path: Path,
+) -> None:
+    """The opening turn goes through pydantic, so a NUL cannot reach the session file.
+
+    `PlanRecording.system` is length-bounded but not NUL-screened, and `Turn`'s validator is the
+    thing that screens it. Building the opening with `model_copy(update=...)` skipped that
+    validator: the store wrote the file and only then failed, leaving a session on disk that
+    `kit session list` refuses to read -- for the whole directory -- until someone deletes it by
+    hand. The refusal has to come first, and nothing may be written.
+    """
+    demo = _copy_demo(tmp_path)
+    _edit(demo / "plan.json", lambda d: d.update(system=d["system"] + "\u0000"))
+    code, lines, err = _run(tmp_path, replay=demo)
+    assert code == 2
+    assert lines == []
+    assert PlanReason.RECORDING_INVALID.value in err
+    assert _sessions(tmp_path) == [], "a session file was written before the NUL was refused"
+    # And the store is still readable: no orphan left to break `kit session list`.
+    assert SessionStore(tmp_path / "sessions").list_sessions(DEV) == ()
+    assert "\x00" not in err
 
 
 def test_a_staged_patch_that_is_not_usable_text_is_refused(tmp_path: Path) -> None:

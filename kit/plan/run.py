@@ -179,8 +179,17 @@ class PlanReport:
 
 
 def _opening(turn: Turn, *, user_message: str, system: str, nonce: str) -> Turn:
-    return turn.model_copy(
-        update={"user_message": user_message, "system": system, "fence_nonce": nonce}
+    """The first turn of a stored session, with the opening fields set.
+
+    Built with `model_validate`, not `model_copy(update=...)`: `model_copy` does not run the
+    validators, so a `system` carrying a NUL -- which `PlanRecording` bounds in length but does not
+    screen -- would reach `SessionStore.create` unchecked. The store writes the file before the
+    session is read back, so the NUL landed on disk and then failed, leaving an unreadable session
+    that makes `kit session list` refuse the whole directory until someone deletes the file. The
+    boundary is here, as `AGENTS.md` requires.
+    """
+    return Turn.model_validate(
+        turn.model_dump() | {"user_message": user_message, "system": system, "fence_nonce": nonce}
     )
 
 
