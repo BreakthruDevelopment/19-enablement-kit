@@ -333,6 +333,49 @@ def test_the_same_commit_and_mode_is_posted_once(tmp_path: Path) -> None:
     assert "already posted" in err
 
 
+def test_an_existing_review_means_no_pass_runs_at_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dedupe is checked *before* the passes, not only before the post.
+
+    `kit-review.yml` triggers on `labeled`, so adding any label to a reviewed pull request re-runs
+    this command. Checking only at posting time would repeat every paid model call and throw the
+    report away -- and a provider failure in that repeat would fail a run that had already
+    succeeded. The spy below is the whole test: if the passes are reached, it raises.
+    """
+    api = FakeApi()
+    assert go(tmp_path, api)[0] == 0
+
+    def must_not_run(*args: Any, **kwargs: Any) -> int:
+        raise AssertionError("run_review_command was called for an already-reviewed commit")
+
+    monkeypatch.setattr(ci_module, "run_review_command", must_not_run)
+    code, err = go(tmp_path, api)
+    assert code == 0
+    assert len(api.created) == 1
+    assert "already posted" in err
+
+
+def test_a_new_commit_or_a_new_mode_still_runs_the_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-flight skip is keyed on the commit and the mode, so it cannot swallow a real run."""
+    api = FakeApi()
+    assert go(tmp_path, api)[0] == 0
+    assert go(tmp_path, api, commit=OTHER_SHA)[0] == 0
+    assert len(api.created) == 2
+
+
+def test_an_unreadable_review_list_still_runs_and_posts_nothing(tmp_path: Path) -> None:
+    """A listing failure before the passes is not a reason to skip them: `post_review` makes the
+    same check, and it is the one that refuses to post."""
+    api = FakeApi(unreadable=True)
+    code, err = go(tmp_path, api)
+    assert code == 4
+    assert api.created == []
+    assert "post_unverifiable" in err
+
+
 def test_a_new_commit_or_a_new_mode_is_a_new_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

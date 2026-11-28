@@ -8,7 +8,10 @@ is a ceiling and not a floor, and the cases that fall under it are decided here,
   errors. A *rejected* pass is a different thing and does post, as `blocking`: see
   `kit.review.passes`.
 * the pull request already carries a review from the Actions bot for this commit and this mode:
-  nothing more is posted. A label event or a re-run cannot stack reviews.
+  nothing more is posted, and **no pass runs**. The check is made twice -- once before the passes,
+  so a re-run or any `labeled` event spends no model call on a report that would be discarded, and
+  once in `post_review`, which is authoritative because it is the only path to the pull request. A
+  label event or a re-run cannot stack reviews, nor repeat the model calls behind one.
 * the finished body could satisfy the factory's gate: nothing is posted.
 
 Everything that reaches the pull request goes through `post_review`, and `post_review` is the one
@@ -54,6 +57,7 @@ __all__ = [
     "BOT_LOGIN",
     "GitHubReviews",
     "ReviewsApi",
+    "already_posted",
     "post_review",
     "run_ci_review",
 ]
@@ -155,6 +159,21 @@ def _marker_lines(mode: ReportMode, commit: str) -> frozenset[str]:
     return frozenset({f"Kit-Mode: {mode.value}", f"Kit-Commit: {commit}"})
 
 
+def already_posted(api: ReviewsApi, *, repo: str, pr: int, commit: str, mode: ReportMode) -> bool:
+    """Whether the bot already has a review on `pr` for this commit and mode.
+
+    The one implementation of "at most one", called twice: once before the passes run, so a re-run
+    or a `labeled` event spends no model call on a report that would be discarded, and once inside
+    `post_review`, which is the authoritative check because it is the only path to the pull request.
+    Raises `ReviewError` if the bot's reviews cannot be read in full.
+    """
+    wanted = _marker_lines(mode, commit)
+    return any(
+        wanted <= set(existing.replace("\r", "").split("\n"))
+        for existing in api.bot_review_bodies(repo, pr)
+    )
+
+
 def post_review(
     api: ReviewsApi,
     principal: Principal,
@@ -180,10 +199,8 @@ def post_review(
         raise ReviewError(ReviewReason.REPORT_REFUSED)
     if len(body) > _MAX_BODY_CHARS:
         raise ReviewError(ReviewReason.REPORT_REFUSED)
-    wanted = _marker_lines(mode, commit)
-    for existing in api.bot_review_bodies(repo, pr):
-        if wanted <= set(existing.replace("\r", "").split("\n")):
-            return False
+    if already_posted(api, repo=repo, pr=pr, commit=commit, mode=mode):
+        return False
     api.create_review(repo, pr, commit, body)
     return True
 
@@ -231,6 +248,16 @@ def run_ci_review(
     except KitError as refusal:
         print(f"kit review-ci: {refusal.message}", file=err)
         return 2
+
+    try:
+        if already_posted(reviews, repo=repo, pr=pr, commit=commit, mode=mode):
+            print("kit review-ci: already posted; not repeated, and no pass ran", file=err)
+            return 0
+    except ReviewError:
+        # The bot's reviews could not be listed. Carry on: `post_review` makes the same check and
+        # is the authoritative one, and it posts nothing when the list cannot be read. Saying so
+        # here would put a reason in the log for a run that has not yet decided anything.
+        pass
 
     out = io.StringIO()
     code = run_review_command(
