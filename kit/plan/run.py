@@ -179,8 +179,15 @@ class PlanReport:
 
 
 def _opening(turn: Turn, *, user_message: str, system: str, nonce: str) -> Turn:
-    return turn.model_copy(
-        update={"user_message": user_message, "system": system, "fence_nonce": nonce}
+    """The first turn of a stored session, with the opening fields set.
+
+    Built with `model_validate`, not `model_copy(update=...)`: `model_copy` does not run the
+    validators, so text that `Turn` refuses would reach `SessionStore.create` unchecked, and the
+    store writes the file before the session is read back. The recording is screened at load as
+    well; this is the second guard, and it covers the refine attempt's opening too.
+    """
+    return Turn.model_validate(
+        turn.model_dump() | {"user_message": user_message, "system": system, "fence_nonce": nonce}
     )
 
 

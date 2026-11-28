@@ -355,6 +355,75 @@ def _staged_diff(data: dict[str, Any]) -> str:
     return diff
 
 
+def test_a_nul_in_the_recorded_system_prompt_is_refused_before_anything_is_written(
+    tmp_path: Path,
+) -> None:
+    """The recording's own opening text is screened, so a NUL cannot reach a session file.
+
+    `test_a_staged_patch_with_a_nul_byte_is_refused` covers the NUL that `check_diff` screens, in a
+    staged patch. This is the other one: `PlanRecording.system` is copied into the opening of a
+    stored session. It used to be length-bounded only, and `_opening()` built the turn with
+    `model_copy(update=...)`, which does not run `Turn`'s validators -- so the store wrote the file
+    and only then failed, leaving a session that makes `kit session list` refuse the whole
+    directory until someone deletes it by hand. `_sessions(tmp_path) == []` is the assertion that
+    catches that: it is the one case where it used not to be empty.
+    """
+    demo = _copy_demo(tmp_path)
+    _edit(demo / "plan.json", lambda d: d.update(system=d["system"] + "\u0000"))
+    code, lines, err = _run(tmp_path, replay=demo)
+    assert code == 2
+    assert lines == []
+    assert PlanReason.RECORDING_INVALID.value in err
+    assert _sessions(tmp_path) == [], "a session file was written before the NUL was refused"
+    # The store is still readable: no orphan left behind to break `kit session list`.
+    assert SessionStore(tmp_path / "sessions").list_sessions(DEV) == ()
+    assert "\x00" not in err
+
+
+def test_a_nul_in_the_refinement_recording_is_refused_the_same_way(tmp_path: Path) -> None:
+    """The second call site of `_opening()`, screened by the same validator on `RefineRecording`."""
+    demo = _copy_demo(tmp_path)
+    _edit(demo / "refine.json", lambda d: d.update(system=d["system"] + "\u0000"))
+    code, _, err = _run(tmp_path, replay=demo, refine=True)
+    assert code == 2
+    assert PlanReason.RECORDING_INVALID.value in err
+
+
+def test_a_recorded_plan_cannot_break_the_json_lines_contract(tmp_path: Path) -> None:
+    """Stdout stays one JSON object per line for a Unicode-aware splitter.
+
+    The recorded plan text is the only free text copied verbatim to stdout. U+2028 and U+2029 are
+    line terminators to `str.splitlines()` and to JavaScript but not to `json.dumps`, so writing
+    the line with `ensure_ascii=False` let a recording split one object across two lines -- which
+    broke this file's own `_run` helper, not just a hypothetical reader. Asserted on the bytes and
+    on the line count, so the fix cannot be undone without a failure.
+    """
+    demo = _copy_demo(tmp_path)
+    _edit(
+        demo / "plan.json",
+        lambda d: d["planned"][1]["tool_uses"][0]["input"].update(
+            plan="Bind both values.\u2028Second line.\u2029Third."
+        ),
+    )
+    out, err = io.StringIO(), io.StringIO()
+    code = run_plan_command(
+        TASK,
+        principal=DEV,
+        replay_dir=demo,
+        directory=tmp_path / "sessions",
+        criteria_dir=CRITERIA,
+        out=out,
+        err=err,
+    )
+    assert code == 0, err.getvalue()
+    text = out.getvalue()
+    assert "\u2028" not in text and "\u2029" not in text
+    # Both splitters agree on the line count, and every line parses on its own.
+    assert len(text.splitlines()) == len(text.rstrip("\n").split("\n")) == 4
+    for line in text.splitlines():
+        json.loads(line)
+
+
 def test_a_staged_patch_with_a_nul_byte_is_refused(tmp_path: Path) -> None:
     # It starts with `diff --git`, so only the review's own diff check can refuse it.
     demo = _copy_demo(tmp_path)
