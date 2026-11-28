@@ -52,7 +52,8 @@ def test_adapter_architecture_is_checked_in_the_build() -> None:
     assert "amd64) want=62" in check
     assert "arm64) want=183" in check
     assert "od -An -tu2 -j18 -N2 /opt/extensions/lambda-adapter" in check
-    assert '"$got" != "$want"' in check and "exit 1" in check
+    # A mismatch must fail the build: exit 1 inside the comparison's own then-branch.
+    assert re.search(r'\[ "\$got" != "\$want" \]; then [^;]*;\s*exit 1; fi', check)
     assert _index("ARG TARGETARCH") < _index("RUN set -eu;")
     # The check must run on the adapter, so after it lands.
     assert _index("COPY --from=public.ecr.aws/") < _index("RUN set -eu;")
