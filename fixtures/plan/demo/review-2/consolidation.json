@@ -1,0 +1,13 @@
+{
+ "description": "Recorded consolidation pass over the second attempt's patch (round 2 of the refinement demo).",
+ "replies": [
+  {
+   "stop_reason": "end_turn",
+   "text": "{\"groups\": [{\"members\": [0]}]}",
+   "usage": {
+    "input_tokens": 1500,
+    "output_tokens": 20
+   }
+  }
+ ]
+}

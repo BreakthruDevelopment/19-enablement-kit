@@ -10,6 +10,7 @@ from typing import cast
 
 from kit import __version__
 from kit.erp.command import register_erp, run_erp_command
+from kit.plan.command import register_plan
 from kit.scaffold.command import register_new, run_new
 from kit.scout.command import engineer_from_environment as scout_principal
 from kit.scout.command import register_scout, run_scout_command
@@ -25,6 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_new(commands)
     register_erp(commands)
     register_scout(commands)
+    register_plan(commands)
 
     review = commands.add_parser(
         "review", help="run the review passes over a diff, against the written criteria"
@@ -37,6 +39,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="directory of per-pass recorded replies (default: replies/ beside the diff)",
     )
     review.add_argument(
+        "--criteria", type=Path, default=Path("criteria"), help="the criteria directory"
+    )
+
+    review_ci = commands.add_parser(
+        "review-ci",
+        help="the headless reviewer: run the passes as `ci` and post at most one review",
+    )
+    review_ci.add_argument("diff", type=Path, help="the pull request's unified diff file")
+    review_ci.add_argument("--repo", required=True, help="owner/name of the repository")
+    review_ci.add_argument("--pr", required=True, type=int, help="the pull request number")
+    review_ci.add_argument("--commit", required=True, help="the head commit the diff ends at")
+    review_ci.add_argument(
+        "--live", action="store_true", help="call the model; default is recorded replies"
+    )
+    review_ci.add_argument(
+        "--replay", type=Path, default=None, help="directory of per-pass recorded replies"
+    )
+    review_ci.add_argument(
         "--criteria", type=Path, default=Path("criteria"), help="the criteria directory"
     )
 
@@ -90,6 +110,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             replay_dir=args.replay,
             criteria_dir=args.criteria,
         )
+    if command == "review-ci":
+        from kit.review.ci import run_ci_review
+
+        return run_ci_review(
+            args.diff,
+            repo=args.repo,
+            pr=args.pr,
+            commit=args.commit,
+            live=args.live,
+            replay_dir=args.replay,
+            criteria_dir=args.criteria,
+        )
     if command == "session":
         # Imported here so the other commands do not load the session package.
         from kit.session.command import (
@@ -107,5 +139,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.session_command == "fork":
             return run_fork_command(principal, args.session_id, args.turn, directory=args.directory)
         return 2
+    if command == "plan":
+        # Imported here so the other commands do not load the plan package and the agent loop.
+        from kit.plan.command import engineer_from_environment as plan_principal
+        from kit.plan.command import run_plan_command
+
+        return run_plan_command(
+            args.task,
+            principal=plan_principal(),
+            replay_dir=args.replay,
+            directory=args.directory,
+            criteria_dir=args.criteria,
+            refine=args.refine,
+        )
     print(f"kit {__version__}: no command given; see --help", file=sys.stderr)
     return 2

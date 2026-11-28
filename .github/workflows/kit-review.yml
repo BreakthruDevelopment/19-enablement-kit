@@ -1,0 +1,98 @@
+name: Kit review
+# The kit's own reviewer (`kit review-ci`) on a pull request in this repo, as the `ci` principal.
+#
+# * Recorded replies by default: free, and no credential is touched. Live model calls happen only
+#   when BOTH the secret KIT_REVIEW_AWS_ROLE_ARN is set AND the pull request carries the label
+#   `kit-review-live`.
+# * At most one review per head commit and mode, as a COMMENT carrying the kit's own `Kit-Review:`
+#   marker. It never carries the factory's `Reviewer:`/`Verdict:` lines (the step refuses a body the
+#   merge gate could read), and it never satisfies `Reviewer sign-off`: that stays a person's.
+# * A pass that got no parseable response posts NOTHING and errors this step. A rejected pass posts
+#   `blocking`. The command decides; this file only wires it.
+# * This job is not one of the four required checks and must not take their names: the required
+#   names are `Lint, test, build, smoke` and `Container image` (ci.yml) and the review-gate jobs.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+concurrency:
+  group: kit-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  kit-review:
+    name: Kit review
+    # A fork's pull_request token is read-only and holds no secrets, so it could not post anyway.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write # to post the one review; `kit review-ci` calls no other endpoint
+      id-token: write # only used by the live-mode credentials step below
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          # The token is passed to the posting step alone, never left in .git/config for the diff
+          # step or for repository code to find.
+          persist-credentials: false
+
+      - name: Choose the mode
+        id: mode
+        env:
+          # Booleans only: the secret's value is never put in an environment variable here.
+          HAS_SECRET: ${{ secrets.KIT_REVIEW_AWS_ROLE_ARN != '' }}
+          HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'kit-review-live') }}
+        run: |
+          if [ "$HAS_SECRET" = "true" ] && [ "$HAS_LABEL" = "true" ]; then
+            echo "live=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "live=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+
+      - name: Credentials for live mode
+        if: steps.mode.outputs.live == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.KIT_REVIEW_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.KIT_REVIEW_AWS_REGION || 'us-east-1' }}
+
+      - name: Diff of the pull request
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/kit-review"
+          git diff --no-color --no-ext-diff --no-textconv "$BASE_SHA...$HEAD_SHA" \
+            > "$RUNNER_TEMP/kit-review/change.diff"
+
+      - name: Review
+        env:
+          # Event values reach the script as environment variables, never interpolated into it.
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LIVE: ${{ steps.mode.outputs.live }}
+          GITHUB_TOKEN: ${{ github.token }}
+          KIT_REVIEW_MODEL_ID: ${{ vars.KIT_REVIEW_MODEL_ID }}
+        run: |
+          args=(--repo "$REPO" --pr "$PR" --commit "$HEAD_SHA")
+          if [ "$LIVE" = "true" ]; then
+            args+=(--live)
+          else
+            args+=(--replay fixtures/pr-review/ci-recorded/replies)
+          fi
+          uv run kit review-ci "$RUNNER_TEMP/kit-review/change.diff" "${args[@]}"
