@@ -101,7 +101,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "scout":
         return run_scout_command(args.root, principal=scout_principal(), replay_dir=args.replay)
     if command == "review":
-        # Imported here so `kit --version` and `kit new` do not load the review package.
+        # What this defers is `kit.review.command`, not the review package: `register_plan` is
+        # imported at module scope and pulls in `kit.review.pipeline` and the rest of the package,
+        # so `kit --version` and `kit new` load it either way. `tests/test_cli.py` pins which
+        # modules survive `import kit.cli`, so this comment cannot drift back to the stronger
+        # claim it used to make.
         from kit.review.command import engineer_from_environment, run_review_command
 
         return run_review_command(
@@ -123,7 +127,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             criteria_dir=args.criteria,
         )
     if command == "session":
-        # Imported here so the other commands do not load the session package.
+        # As on the `review` branch: this defers `kit.session.command` alone. The session package
+        # itself is already loaded, because `register_plan` at module scope reaches `SessionStore`.
         from kit.session.command import (
             engineer_from_environment,
             run_fork_command,

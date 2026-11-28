@@ -1,10 +1,24 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from kit import __version__
 from kit.cli import build_parser, main
+
+
+def _python(code: str) -> str:
+    """Run `code` in a fresh interpreter with the checkout root off `sys.path`."""
+    done = subprocess.run(  # noqa: S603 -- fixed argv, no shell, no external input
+        [sys.executable, "-P", "-c", code],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    return done.stdout
 
 
 def test_main_returns_zero_and_names_the_version(capsys: pytest.CaptureFixture[str]) -> None:
@@ -160,3 +174,43 @@ def test_kit_new_refuses_a_non_empty_target_unless_forced(
     assert forced == 0
     assert (target / "README.md").read_text(encoding="utf-8") == "keep\n"
     assert (target / "CLAUDE.md").is_file()
+
+
+def test_import_kit_cli_defers_only_the_command_modules() -> None:
+    """Pins what the lazy imports in `main()` actually buy.
+
+    Three comments in `kit/cli.py` used to claim the deferred import kept a whole package out of
+    `kit --version`. It does not: `register_plan` is imported at module scope and reaches the
+    review pipeline, the session store and app 17's agent loop, so the packages load either way.
+    What is deferred is the four `*.command` modules and `kit.review.ci`.
+
+    A comment cannot fail, so the claim is asserted here instead. Run in a subprocess because this
+    test session has already imported most of the tree; `-P` keeps the checkout root off
+    `sys.path`, so the import resolves the installed package.
+    """
+    probe = (
+        "import kit.cli, sys, json;"
+        "print(json.dumps(sorted(m for m in sys.modules"
+        " if m.startswith(('kit.', 'agent_container')))))"
+    )
+    loaded = set(json.loads(_python(probe)))
+
+    # Deferred: each is imported inside its own branch of `main()`.
+    # (`kit.plan.command` is NOT in this list: it is imported at module scope, which is exactly
+    # why its own branch no longer claims to be a lazy import.)
+    for deferred in (
+        "kit.review.command",
+        "kit.review.ci",
+        "kit.session.command",
+    ):
+        assert deferred not in loaded, f"{deferred} is no longer deferred"
+
+    # Loaded anyway, which is the half the comments used to deny. If a later change does make the
+    # packages lazy, this fails and the comments get rewritten with it rather than going stale.
+    for eager in (
+        "kit.review.pipeline",
+        "kit.review.inputs",
+        "kit.session.store",
+        "agent_container.core.loop",
+    ):
+        assert eager in loaded, f"{eager} is no longer loaded by `import kit.cli`"

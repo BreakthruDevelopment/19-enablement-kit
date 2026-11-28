@@ -37,7 +37,7 @@ from kit.plan.recording import (
 )
 from kit.plan.run import _opening, build_refine_opening, run_plan
 from kit.review.criteria import load_criteria
-from kit.review.inputs import MAX_DIFF_FILES
+from kit.review.inputs import MAX_DIFF_FILES, count_changed_files
 from kit.review.pipeline import run_review
 from kit.review.replay import ReplayDirectory
 from kit.session import SessionStore, resume
@@ -470,19 +470,44 @@ def test_a_staged_patch_with_a_nul_byte_is_refused(tmp_path: Path) -> None:
 
 
 def test_a_staged_patch_touching_too_many_files_is_refused(tmp_path: Path) -> None:
-    # The 200 KB byte cap is not reachable here: a recorded tool input is capped at 64 KiB by the
-    # session `Turn`, which refuses the file as `recording_invalid` first. The file cap is.
+    """The file cap at its boundary, spelled with literals.
+
+    The 200 KB byte cap is not reachable here: a recorded tool input is capped at 64 KiB by the
+    session `Turn`, which refuses the file as `recording_invalid` first. The file cap is.
+
+    `401`, not `MAX_DIFF_FILES + 1`. Spelled with the constant, raising the cap raised this test
+    with it and the suite stayed green on a cap that no longer bounded anything -- verified before
+    this change: `MAX_DIFF_FILES` 400 -> 450 and 400 -> 500 each survived all 806 tests. The
+    behaviour assertions come first and the constant is pinned separately at the end, the same
+    ordering as the `MAX_PLAN_CHARS` block below, so a failure reads as behaviour rather than as
+    arithmetic.
+    """
     demo = _copy_demo(tmp_path)
 
-    def grow(data: dict[str, Any]) -> None:
+    def pad_to(data: dict[str, Any], total: int) -> None:
+        """Pad the staged diff to exactly `total` changed files."""
         use = _first_use(data["direct"][0])
-        use["input"]["diff"] += "+++ b/f\n" * (MAX_DIFF_FILES + 1)
+        extra = total - count_changed_files(use["input"]["diff"])
+        # Guards the padding against a demo recording that grows: at <= 0 the line below appends
+        # nothing and the test would pass for the wrong reason.
+        assert extra > 0, f"the demo's staged diff already names {total} files"
+        use["input"]["diff"] += "+++ b/f\n" * extra
 
-    _edit(demo / "plan.json", grow)
+    # One over the cap is refused...
+    _edit(demo / "plan.json", lambda data: pad_to(data, 401))
     code, _, err = _run(tmp_path, replay=demo)
     assert code == 2, err
     assert PlanReason.BAD_PATCH.value in err
     assert _sessions(tmp_path) == []
+
+    # ...and exactly at the cap is not. Without this side a *lowered* cap would also pass the
+    # refusal above; with it, the boundary is pinned from both directions.
+    at_cap = _copy_demo(tmp_path / "at-cap")
+    _edit(at_cap / "plan.json", lambda data: pad_to(data, 400))
+    code, _, err = _run(tmp_path / "at-cap", replay=at_cap)
+    assert code == 0, err
+
+    assert MAX_DIFF_FILES == 400
 
 
 def _with_plan_text(text: str) -> PlanRecording:
