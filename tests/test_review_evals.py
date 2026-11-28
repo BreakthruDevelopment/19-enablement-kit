@@ -49,7 +49,7 @@ from kit.review import (
 )
 from kit.review.command import run_review_command
 from kit.review.criteria import parse_criteria
-from kit.review.inputs import MAX_DIFF_BYTES, MAX_DIFF_FILES
+from kit.review.inputs import MAX_DIFF_BYTES, MAX_DIFF_FILES, check_diff
 from kit.review.passes import PassStatus
 from kit.review.schema import MAX_FINDINGS_SCHEMA
 
@@ -562,12 +562,38 @@ def test_the_fence_nonce_is_stripped_from_the_diff_the_model_reads() -> None:
 
 
 def test_an_oversized_diff_is_refused_before_any_model_call() -> None:
+    """What this one is for is the *before any model call* half; the boundary is pinned below.
+
+    `200 * 1024 + 1`, not `MAX_DIFF_BYTES`: spelled with the constant, this test moved with the
+    cap. Verified before this change: `MAX_DIFF_BYTES` 200 KB -> 2000 KB survived all 806 tests,
+    and this was the only live pin on its value.
+    """
     providers, made = scripted()
-    big = "+" + "x" * MAX_DIFF_BYTES + "\n"
+    big = "x" * (200 * 1024 + 1)
     with pytest.raises(ReviewError) as refused:
         run(big, providers)
     assert refused.value.reason is ReviewReason.DIFF_TOO_LARGE
     assert all(m.requests == [] for m in made.values())
+
+
+def test_a_diff_is_accepted_at_the_byte_cap_and_refused_one_byte_over() -> None:
+    """The byte cap's boundary, on `check_diff` itself.
+
+    `check_diff` is the control, and reaching it through `run()` is not needed to pin a byte
+    count. One `x` is one UTF-8 byte and `check_diff` measures the encoded length, so the string
+    length is the byte length. A diff of plain `x`s carries no `diff --git ` or `+++ ` header, so
+    `count_changed_files` sees 0 and the file cap cannot be what refuses the second one.
+
+    The cap is live code, not dead: it is unreachable on the recording path, where
+    `_MAX_TOOL_INPUT_CHARS` (`kit/session/models.py`) refuses a 70 KiB staged diff first, but
+    `kit/review/pipeline.py` reaches it with no `Turn` in the way.
+    """
+    check_diff("x" * (200 * 1024))
+    with pytest.raises(ReviewError) as refused:
+        check_diff("x" * (200 * 1024 + 1))
+    assert refused.value.reason is ReviewReason.DIFF_TOO_LARGE
+
+    assert MAX_DIFF_BYTES == 200 * 1024
 
 
 def test_the_file_cap_counts_changed_files() -> None:
@@ -577,11 +603,15 @@ def test_the_file_cap_counts_changed_files() -> None:
             for i in range(n)
         )
 
+    # Literals, for the reason given in the byte-cap test above: `MAX_DIFF_FILES` here let
+    # 400 -> 450 and 400 -> 500 through all 806 tests.
     providers, _ = scripted()
-    assert run(many(MAX_DIFF_FILES), providers).complete
+    assert run(many(400), providers).complete
     with pytest.raises(ReviewError) as refused:
-        run(many(MAX_DIFF_FILES + 1), providers)
+        run(many(401), providers)
     assert refused.value.reason is ReviewReason.DIFF_TOO_MANY_FILES
+
+    assert MAX_DIFF_FILES == 400
 
 
 @pytest.mark.parametrize(
