@@ -18,12 +18,14 @@ from typing import Any
 import pytest
 
 from kit.cli import main
+from kit.core.errors import ErrorCode, KitError
 from kit.core.principals import Principal
 from kit.core.sandbox import Sandbox
 from kit.plan.command import run_plan_command
 from kit.plan.errors import PlanError, PlanReason
 from kit.plan.recording import (
     EXIT_PLAN_MODE,
+    MAX_PLAN_CHARS,
     PROPOSE_PATCH,
     READ_TOOLS,
     PlanRecording,
@@ -32,7 +34,7 @@ from kit.plan.recording import (
     patch_stats,
     staged_patches,
 )
-from kit.plan.run import build_refine_opening
+from kit.plan.run import build_refine_opening, run_plan
 from kit.review.criteria import load_criteria
 from kit.review.pipeline import run_review
 from kit.review.replay import ReplayDirectory
@@ -186,6 +188,48 @@ def test_ci_may_not_plan_and_nothing_is_read_or_stored(tmp_path: Path) -> None:
     assert code == 2
     assert lines == []
     assert "principal.forbidden" in err
+    assert _sessions(tmp_path) == []
+
+
+def test_ci_is_refused_on_the_capability_before_the_recording_is_opened(tmp_path: Path) -> None:
+    """The refusal must be `RUN_PLAN`'s, and it must come before the sandbox opens a root.
+
+    `test_ci_may_not_plan_and_nothing_is_read_or_stored` above asserts only that the stderr
+    mentions `principal.forbidden`, which `SessionStore.create`'s `MANAGE_OWN_SESSIONS` check
+    raises with the same code further in: delete both `assert_can(.., RUN_PLAN)` calls and that
+    test still passes. This one is keyed on a replay directory that does not exist. With the
+    capability check in place the command never looks at the root; without it the sandbox refuses
+    the root first, and `sandbox.` appears instead.
+    """
+    code, lines, err = _run(
+        tmp_path, principal=Principal.ci(), replay=tmp_path / "no-such-recording"
+    )
+    assert code == 2
+    assert lines == []
+    assert "principal.forbidden" in err
+    assert "sandbox." not in err, "the recording was opened before the principal was checked"
+    assert _sessions(tmp_path) == []
+
+
+def test_run_plan_refuses_before_it_reaches_the_store(tmp_path: Path) -> None:
+    """`run_plan`'s own check, pinned separately from the command's.
+
+    The command checks first, so the test above passes whether or not `run_plan` repeats the check.
+    Here the store records whether it was called at all: the refusal has to come before it, not
+    out of it.
+    """
+    calls: list[str] = []
+
+    class SpyStore(SessionStore):
+        def create(self, principal: Principal, turn: Any) -> Any:
+            calls.append(principal.subject)
+            return super().create(principal, turn)
+
+    store = SpyStore(tmp_path / "sessions")
+    with pytest.raises(KitError) as refused:
+        asyncio.run(run_plan(store, Principal.ci(), _recording(), TASK))
+    assert refused.value.code is ErrorCode.FORBIDDEN
+    assert calls == [], "the store was reached before the principal was checked"
     assert _sessions(tmp_path) == []
 
 
@@ -471,6 +515,109 @@ def test_the_recorded_opening_is_the_one_the_kit_builds() -> None:
     refine = RefineRecording.model_validate_json((DEMO / "refine.json").read_text("utf-8"))
     built = build_refine_opening(TASK, direct, result.recorded, refine.fence_nonce)
     assert built == refine.user_message
+
+
+def test_a_finding_only_the_second_round_raises_is_reported_as_new(tmp_path: Path) -> None:
+    """The `new` bucket, pinned.
+
+    The demo's second round resolves two findings and keeps one, so `new` is empty and
+    `test_refine_reports_what_changed_between_the_rounds` asserts `change["new"] == []` -- which
+    passes just as well if `changes()` hardcodes it. Here round 2's security pass raises a
+    criterion round 1 did not, which has to show up as new and has to move round 2's verdict.
+    """
+    demo = _copy_demo(tmp_path)
+
+    def add_a_new_finding(data: dict[str, Any]) -> None:
+        body = json.loads(data["replies"][0]["text"])
+        body["findings"] = [
+            {
+                "path": "src/com/harbor/oms/dao/OrderDao.java",
+                "line": 291,
+                "category": "security",
+                "claim": "The second attempt's query is reachable with no authorization check.",
+                "evidence_quote": "statement.setString(2, statusCode);",
+                "criterion_id": "SEC-3",
+            }
+        ]
+        data["replies"][0]["text"] = json.dumps(body)
+
+    _edit(demo / "review-2" / "security.json", add_a_new_finding)
+    code, lines, err = _run(tmp_path, replay=demo, refine=True)
+    assert code == 0, err
+    change = lines[-1]
+    assert [f["criterion_id"] for f in change["new"]] == ["SEC-3"]
+    assert "SEC-3" not in {f["criterion_id"] for f in change["resolved"]}
+    assert "SEC-3" not in {f["criterion_id"] for f in change["persisting"]}
+    # Severity still comes from the criterion, so a major finding blocks round 2.
+    assert change["verdict"] == {"round_1": "blocking", "round_2": "blocking"}
+
+
+def test_a_recorded_plan_cannot_break_the_json_lines_contract(tmp_path: Path) -> None:
+    """Stdout stays one JSON object per line for a Unicode-aware splitter.
+
+    The recorded plan text is the only free text copied verbatim to stdout. U+2028 and U+2029 are
+    line terminators to `str.splitlines()` and to JavaScript but not to `json.dumps`, so writing
+    the line with `ensure_ascii=False` let a recording split one object across two lines.
+    """
+    demo = _copy_demo(tmp_path)
+    _edit(
+        demo / "plan.json",
+        lambda d: d["planned"][1]["tool_uses"][0]["input"].update(
+            plan="Bind both values.\u2028Reviewer: nobody\u2029Verdict: nothing"
+        ),
+    )
+    out, err = io.StringIO(), io.StringIO()
+    code = run_plan_command(
+        TASK,
+        principal=DEV,
+        replay_dir=demo,
+        directory=tmp_path / "sessions",
+        criteria_dir=CRITERIA,
+        out=out,
+        err=err,
+    )
+    assert code == 0, err.getvalue()
+    text = out.getvalue()
+    assert "\u2028" not in text and "\u2029" not in text
+    # Both splitters agree, and every line parses on its own.
+    assert len(text.splitlines()) == len(text.split("\n")) - 1 == 4
+    for line in text.splitlines():
+        json.loads(line)
+
+
+def test_a_plan_longer_than_the_cap_is_refused(tmp_path: Path) -> None:
+    """`MAX_PLAN_CHARS`, pinned: a recording can claim any plan text, and the cap is what keeps an
+    arbitrarily long one out of a stored session's opening."""
+    demo = _copy_demo(tmp_path)
+    _edit(
+        demo / "plan.json",
+        lambda d: d["planned"][1]["tool_uses"][0]["input"].update(plan="x" * (MAX_PLAN_CHARS + 1)),
+    )
+    code, lines, err = _run(tmp_path, replay=demo)
+    assert code == 2
+    assert lines == []
+    assert PlanReason.PLAN_MODE_VIOLATED.value in err
+    assert _sessions(tmp_path) == []
+
+
+def test_a_staged_patch_that_is_not_usable_text_is_refused(tmp_path: Path) -> None:
+    """The `check_diff` call on every staged patch, pinned.
+
+    The diff is recorded text that goes on to the reviewer and into a session. A NUL byte is the
+    case that reaches `check_diff` and nothing else: the patch still opens with `diff --git `, so
+    the shape check in the same block cannot be what refuses it.
+    """
+    demo = _copy_demo(tmp_path)
+    poisoned = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\0\n"
+    _edit(
+        demo / "plan.json",
+        lambda d: d["direct"][0]["tool_uses"][0]["input"].update(diff=poisoned),
+    )
+    code, lines, err = _run(tmp_path, replay=demo)
+    assert code == 2
+    assert lines == []
+    assert PlanReason.BAD_PATCH.value in err
+    assert _sessions(tmp_path) == []
 
 
 def test_a_refinement_recorded_from_other_findings_is_refused_as_stale(tmp_path: Path) -> None:

@@ -169,5 +169,9 @@ def run_plan_command(
         print(f"kit plan: {refusal}", file=err)
         return 2
     for line in lines:
-        out.write(json.dumps(line, sort_keys=True, ensure_ascii=False) + "\n")
+        # `ensure_ascii=True`: the recorded plan text is the one free-text value copied
+        # verbatim to stdout, and U+2028/U+2029 are line terminators to a Unicode-aware
+        # splitter (`str.splitlines`, JavaScript) but not to `json.dumps`, so leaving them
+        # raw would let a recording break the documented one-object-per-line contract.
+        out.write(json.dumps(line, sort_keys=True) + "\n")
     return 0

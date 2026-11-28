@@ -140,7 +140,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_fork_command(principal, args.session_id, args.turn, directory=args.directory)
         return 2
     if command == "plan":
-        # Imported here so the other commands do not load the plan package and the agent loop.
+        # Not a lazy import: `register_plan` is imported from this module at module scope, so the
+        # plan package is already loaded. These two names are read here only to keep the branch
+        # self-contained, as the other branches are.
         from kit.plan.command import engineer_from_environment as plan_principal
         from kit.plan.command import run_plan_command
 
