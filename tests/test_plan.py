@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from kit.cli import main
 from kit.core.errors import KitError
@@ -34,7 +35,7 @@ from kit.plan.recording import (
     patch_stats,
     staged_patches,
 )
-from kit.plan.run import build_refine_opening, run_plan
+from kit.plan.run import _opening, build_refine_opening, run_plan
 from kit.review.criteria import load_criteria
 from kit.review.inputs import MAX_DIFF_FILES
 from kit.review.pipeline import run_review
@@ -355,6 +356,102 @@ def _staged_diff(data: dict[str, Any]) -> str:
     return diff
 
 
+def test_a_nul_in_the_recorded_system_prompt_is_refused_before_anything_is_written(
+    tmp_path: Path,
+) -> None:
+    """The recording's own opening text is screened, so a NUL cannot reach a session file.
+
+    `test_a_staged_patch_with_a_nul_byte_is_refused` covers the NUL that `check_diff` screens, in a
+    staged patch. This is the other one: `PlanRecording.system` is copied into the opening of a
+    stored session. It used to be length-bounded only, and `_opening()` built the turn with
+    `model_copy(update=...)`, which does not run `Turn`'s validators -- so the store wrote the file
+    and only then failed, leaving a session that makes `kit session list` refuse the whole
+    directory until someone deletes it by hand. `_sessions(tmp_path) == []` is the assertion that
+    catches that: it is the one case where it used not to be empty.
+    """
+    demo = _copy_demo(tmp_path)
+    _edit(demo / "plan.json", lambda d: d.update(system=d["system"] + "\u0000"))
+    code, lines, err = _run(tmp_path, replay=demo)
+    assert code == 2
+    assert lines == []
+    # First, because this is the one the fix is for: the pre-fix run wrote a file and then failed.
+    assert _sessions(tmp_path) == [], "a session file was written before the NUL was refused"
+    # And the store is still readable: no orphan left behind to break `kit session list`.
+    assert SessionStore(tmp_path / "sessions").list_sessions(DEV) == ()
+    assert PlanReason.RECORDING_INVALID.value in err
+    assert "\x00" not in err
+
+
+def test_the_opening_refuses_text_that_turn_rejects_without_quoting_it() -> None:
+    """`_opening()`'s own guard, pinned, and its refusal checked for a leak.
+
+    The load-time screen makes this unreachable through `kit plan` today, so without a direct test
+    the guard could be removed or reverted to `model_copy(update=...)` with nothing failing. It
+    also has to translate pydantic's `ValidationError`: pydantic puts the offending value in its
+    message and `run_plan_command` catches only the kit's own error types, so an escaping one
+    would print a slice of the recording -- the leak this guard exists to prevent.
+    """
+    canary = "CANARY-7f3a-leak"
+    with pytest.raises(PlanError) as refused:
+        _opening(
+            _recording().prefix[0],
+            user_message="ok",
+            system=canary + "\x00",
+            nonce="abcd1234",
+        )
+    assert refused.value.reason is PlanReason.RECORDING_INVALID
+    # `PlanError` interpolates nothing, so this is a guard on that staying true, not the
+    # discriminator: a leaking `_opening()` raises `ValidationError` and fails `pytest.raises`
+    # above. `str()` is the whole message -- `PlanError` has no `.message`, unlike `KitError`.
+    message = str(refused.value)
+    assert canary not in message
+    assert "\x00" not in message
+
+
+def test_a_nul_in_the_refinement_recording_is_refused_the_same_way(tmp_path: Path) -> None:
+    """The second call site of `_opening()`, screened by the same validator on `RefineRecording`."""
+    demo = _copy_demo(tmp_path)
+    _edit(demo / "refine.json", lambda d: d.update(system=d["system"] + "\u0000"))
+    code, _, err = _run(tmp_path, replay=demo, refine=True)
+    assert code == 2
+    assert PlanReason.RECORDING_INVALID.value in err
+
+
+def test_a_recorded_plan_cannot_break_the_json_lines_contract(tmp_path: Path) -> None:
+    """Stdout stays one JSON object per line for a Unicode-aware splitter.
+
+    The recorded plan text is the only free text copied verbatim to stdout. U+2028 and U+2029 are
+    line terminators to `str.splitlines()` and to JavaScript but not to `json.dumps`, so writing
+    the line with `ensure_ascii=False` let a recording split one object across two lines -- which
+    broke this file's own `_run` helper, not just a hypothetical reader. Asserted on the bytes and
+    on the line count, so the fix cannot be undone without a failure.
+    """
+    demo = _copy_demo(tmp_path)
+    _edit(
+        demo / "plan.json",
+        lambda d: d["planned"][1]["tool_uses"][0]["input"].update(
+            plan="Bind both values.\u2028Second line.\u2029Third."
+        ),
+    )
+    out, err = io.StringIO(), io.StringIO()
+    code = run_plan_command(
+        TASK,
+        principal=DEV,
+        replay_dir=demo,
+        directory=tmp_path / "sessions",
+        criteria_dir=CRITERIA,
+        out=out,
+        err=err,
+    )
+    assert code == 0, err.getvalue()
+    text = out.getvalue()
+    assert "\u2028" not in text and "\u2029" not in text
+    # Both splitters agree on the line count, and every line parses on its own.
+    assert len(text.splitlines()) == len(text.rstrip("\n").split("\n")) == 4
+    for line in text.splitlines():
+        json.loads(line)
+
+
 def test_a_staged_patch_with_a_nul_byte_is_refused(tmp_path: Path) -> None:
     # It starts with `diff --git`, so only the review's own diff check can refuse it.
     demo = _copy_demo(tmp_path)
@@ -392,6 +489,33 @@ def _with_plan_text(text: str) -> PlanRecording:
     data = json.loads((DEMO / "plan.json").read_text("utf-8"))
     _first_use(data["planned"][1])["input"]["plan"] = text
     return PlanRecording.model_validate(data)
+
+
+@pytest.mark.parametrize("field", ["task", "system"])
+def test_the_plan_recording_refuses_a_nul_in_its_opening_text(field: str) -> None:
+    """The load-time screen on `PlanRecording`, pinned directly.
+
+    It has to be pinned here rather than through `kit plan`, because `_opening()` refuses the same
+    input with the same code one step later: nothing observable distinguishes the two layers, so a
+    command-level test passes with this screen deleted. The point of screening at load is that the
+    refusal happens before a root is read or a session is created, and that it is a fixed code
+    rather than a pydantic message carrying the recording's own text.
+    """
+    data = json.loads((DEMO / "plan.json").read_text("utf-8"))
+    PlanRecording.model_validate(data)  # the committed recording is clean
+    data[field] = data[field] + "\x00"
+    with pytest.raises(ValidationError):
+        PlanRecording.model_validate(data)
+
+
+@pytest.mark.parametrize("field", ["system", "user_message"])
+def test_the_refinement_recording_refuses_a_nul_in_its_opening_text(field: str) -> None:
+    """The same screen on `RefineRecording`, pinned the same way and for the same reason."""
+    data = json.loads((DEMO / "refine.json").read_text("utf-8"))
+    RefineRecording.model_validate(data)
+    data[field] = data[field] + "\x00"
+    with pytest.raises(ValidationError):
+        RefineRecording.model_validate(data)
 
 
 def test_a_plan_is_accepted_at_the_cap_and_refused_one_character_over() -> None:

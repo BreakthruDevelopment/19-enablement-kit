@@ -74,7 +74,8 @@ PROPOSE_PATCH: Final = "propose_patch"
 _VOCABULARY: Final = READ_TOOLS | {EXIT_PLAN_MODE, PROPOSE_PATCH}
 
 MAX_PLAN_CHARS: Final = 4_000
-# Both files together are a few kilobytes. The cap refuses a runaway file before it is parsed.
+# Both files together are a few kilobytes. This is the sandbox's own default file cap, restated
+# here so the limit a recording is read under is named where it is used, not inherited silently.
 MAX_RECORDING_BYTES: Final = 512 * 1024
 _MAX_TURNS: Final = 24
 
@@ -107,6 +108,15 @@ class PlanRecording(BaseModel):
         check_nonce(value)
         return value
 
+    @field_validator("task", "system")
+    @classmethod
+    def _opening_text(cls, value: str) -> str:
+        # `Turn` screens its own text fields; these two come from the recording and are copied
+        # into the opening of a stored session, so the boundary is here. Refused at load time as
+        # `plan.recording_invalid`, a fixed code, so the recording's own bytes never reach a
+        # message -- letting pydantic's error escape instead would put them there.
+        return _no_nul(value)
+
     @field_validator("prefix", "planned", "direct")
     @classmethod
     def _turns(cls, value: tuple[Turn, ...]) -> tuple[Turn, ...]:
@@ -129,6 +139,11 @@ class RefineRecording(BaseModel):
     def _nonce(cls, value: str) -> str:
         check_nonce(value)
         return value
+
+    @field_validator("system", "user_message")
+    @classmethod
+    def _opening_text(cls, value: str) -> str:
+        return _no_nul(value)
 
     @field_validator("attempt")
     @classmethod
@@ -167,6 +182,12 @@ def load_refine_recording(sandbox: Sandbox, directory: Path) -> RefineRecording:
         return RefineRecording.model_validate(data)
     except ValidationError:
         raise PlanError(PlanReason.RECORDING_INVALID) from None
+
+
+def _no_nul(value: str) -> str:
+    if "\x00" in value:
+        raise ValueError("a text field cannot contain a NUL")
+    return value
 
 
 def _names(turn: Turn) -> list[str]:

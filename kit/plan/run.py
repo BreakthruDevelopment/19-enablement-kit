@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from agent_container.core.loop import MAX_USER_MESSAGE_CHARS
+from pydantic import ValidationError
 
 from kit.core.principals import Capability, Principal, assert_can
 from kit.plan.errors import PlanError, PlanReason
@@ -179,9 +180,25 @@ class PlanReport:
 
 
 def _opening(turn: Turn, *, user_message: str, system: str, nonce: str) -> Turn:
-    return turn.model_copy(
-        update={"user_message": user_message, "system": system, "fence_nonce": nonce}
-    )
+    """The first turn of a stored session, with the opening fields set.
+
+    Built with `model_validate`, not `model_copy(update=...)`: `model_copy` does not run the
+    validators, so text that `Turn` refuses would reach `SessionStore.create` unchecked, and the
+    store writes the file before the session is read back. The recording is screened at load as
+    well; this is the second guard, and it covers the refine attempt's opening too.
+
+    The `ValidationError` is translated rather than allowed to propagate. Pydantic puts the
+    offending value in its message, and `run_plan_command` catches only the kit's own error types,
+    so an escaping one would print a slice of the recording -- which is the leak this guard exists
+    to prevent. `plan.recording_invalid` is the same refusal the load-time screen makes.
+    """
+    try:
+        return Turn.model_validate(
+            turn.model_dump()
+            | {"user_message": user_message, "system": system, "fence_nonce": nonce}
+        )
+    except ValidationError:
+        raise PlanError(PlanReason.RECORDING_INVALID) from None
 
 
 def _store_arm(
